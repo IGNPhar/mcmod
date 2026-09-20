@@ -1,0 +1,35 @@
+name: build
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build McMod (32-bit ARM, same as MCPE 1.1.5)
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang"
+          mkdir -p stub out/assets/1.1.3/mods/mcmod/native/armeabi-v7a
+          # empty stand-ins, only so the mod records the same library dependencies as Toolbox's own mods
+          echo "int stub_symbol;" > stub/empty.c
+          "$CC" -shared -fPIC -Wl,-soname,libminecraftpe.so -o stub/libminecraftpe.so stub/empty.c
+          "$CC" -shared -fPIC -Wl,-soname,libmodloader.so   -o stub/libmodloader.so   stub/empty.c
+          "$CC" -shared -fPIC -O2 -Wall -Wl,--warn-unresolved-symbols \
+                -o out/assets/1.1.3/mods/mcmod/native/armeabi-v7a/libmcmod.so mcmod.c \
+                -Wl,--no-as-needed -Lstub -lminecraftpe -lmodloader
+          cp package.yaml out/assets/1.1.3/mods/mcmod/package.yaml
+          cp config.json  out/assets/1.1.3/config.json
+          echo "--- result ---"
+          readelf -h out/assets/1.1.3/mods/mcmod/native/armeabi-v7a/libmcmod.so | grep -E "Class|Machine"
+          readelf -d out/assets/1.1.3/mods/mcmod/native/armeabi-v7a/libmcmod.so | grep NEEDED
+          readelf -Ws --dyn-syms out/assets/1.1.3/mods/mcmod/native/armeabi-v7a/libmcmod.so | grep -E "UND +_Z|tml_init"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcmod-toolbox
+          path: out
+
