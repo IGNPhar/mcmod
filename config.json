@@ -1,0 +1,15 @@
+{
+  "metal": "1.1/metal.apk",
+  "mods": [
+    "1.1/mods/io.mrarm.tml.assetpatch",
+    "1.1/mods/io.mrarm.tml.assetloader",
+    "1.0/mods/android-ad",
+    "1.1/mods/tbarmorhud",
+    "1.1/mods/tbtreecapitator",
+    "1.1/mods/tbxray",
+    "1.1.3/mods/tbminimap",
+    "1.1.3/mods/tbdamageindicators",
+    "1.1.3/mods/tbmenu",
+    "1.1.3/mods/mcmod"
+  ]
+}
