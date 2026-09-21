@@ -13,21 +13,21 @@ extern "C" {
   X(autosprint,   I, 1,    0, 1) \
   X(fps_on,       I, 0,    0, 1) X(fps_x, F, 0.02, 0, 1) X(fps_y, F, 0.02, 0, 1) X(fps_size, I, 3, 1, 8) \
   X(fps_alpha,    F, 1.0,  0.1, 1) X(fps_bg, I, 1, 0, 1) X(fps_menus, I, 1, 0, 1) \
-  X(armor_on,     I, 0,    0, 1) X(armor_x, F, 0.02, 0, 1) X(armor_y, F, 0.30, 0, 1) X(armor_size, I, 3, 1, 8) \
-  X(armor_alpha,  F, 1.0,  0.1, 1) X(armor_bg, I, 1, 0, 1) X(armor_bar, I, 1, 0, 1) X(armor_num, I, 1, 0, 2) \
+  X(armor_on,     I, 1,    0, 1) X(armor_x, F, 0.005, 0, 1) X(armor_y, F, 0.03, 0, 1) X(armor_size, I, 3, 1, 8) \
+  X(armor_alpha,  F, 1.0,  0.1, 1) X(armor_bg, I, 0, 0, 1) X(armor_bar, I, 0, 0, 1) X(armor_num, I, 1, 0, 2) \
   X(armor_horiz,  I, 0,    0, 1) \
-  X(elytra_on,    I, 0,    0, 1) X(elytra_x, F, 0.50, 0, 1) X(elytra_y, F, 0.62, 0, 1) X(elytra_size, I, 3, 1, 8) \
+  X(elytra_on,    I, 1,    0, 1) X(elytra_x, F, 0.50, 0, 1) X(elytra_y, F, 0.56, 0, 1) X(elytra_size, I, 3, 1, 8) X(elytra_style, I, 0, 0, 2) \
   X(elytra_alpha, F, 1.0,  0.1, 1) \
   X(nohurt,       I, 0,    0, 1) \
   X(zoom_on,      I, 0,    0, 1) X(zoom_x, F, 0.90, 0, 1) X(zoom_y, F, 0.30, 0, 1) X(zoom_btn, I, 3, 1, 8) \
-  X(zoom_alpha,   F, 0.85, 0.1, 1) X(zoom_level, F, 4.0, 1.5, 12) \
+  X(zoom_alpha,   F, 0.85, 0.1, 1) X(zoom_level, F, 4.0, 1.5, 12) X(zoom_label, I, 0, 0, 7) \
   X(persp_on,     I, 0,    0, 1) X(persp_x, F, 0.90, 0, 1) X(persp_y, F, 0.46, 0, 1) X(persp_btn, I, 3, 1, 8) \
-  X(persp_alpha,  F, 0.85, 0.1, 1) \
+  X(persp_alpha,  F, 0.85, 0.1, 1) X(persp_label, I, 0, 0, 7) \
   X(perf_gfx,     I, 0,    0, 1) X(perf_light, I, 0, 0, 1) X(perf_skies, I, 0, 0, 1) X(perf_bob, I, 0, 0, 1) \
   X(perf_view_on, I, 0,    0, 1) X(perf_view, I, 6, 2, 16) \
   X(ui_font,      I, 0,    0, 6) \
   X(n_x,          F, 0.92, 0, 1) X(n_y, F, 0.80, 0, 1) X(n_btn, I, 3, 1, 8) X(n_alpha, F, 1.0, 0.2, 1) \
-  X(n_always,     I, 0,    0, 1) \
+  X(n_always,     I, 0,    0, 1) X(n_label, I, 0, 0, 7) \
   X(hook_hurt,    I, 1,    0, 1) X(hook_fov, I, 1, 0, 1) X(hook_persp, I, 1, 0, 1) X(hook_perf, I, 1, 0, 1)
 
 #define NC_TYPE_I int
