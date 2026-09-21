@@ -859,13 +859,17 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool elytra_vis = g_cfg.elytra_on && in_world && g_snap.gliding && !g_menu_open && !g_edit;
     bool elytra_angle_vis = g_cfg.elytra_angle_on && in_world && g_snap.gliding && !g_menu_open && !g_edit;
     bool hud_btns   = play_hud && !in_settings && !g_menu_open && !g_edit;
+    /* The N button is the Night Client entry point; it must not depend on the
+     * settings-screen hook being active. Keeping it visible also keeps ImGui
+     * alive when no other optional HUD module is enabled. */
+    bool n_vis      = !g_menu_open && !g_edit;
     bool f3_vis     = g_cfg.f3_on && hud_btns;
     bool zoom_vis   = g_cfg.zoom_on && hud_btns;
     bool persp_vis  = g_cfg.persp_on && hud_btns;
     if (!zoom_vis) g_zoom_active = 0;
     if (!f3_vis && !g_cfg.f3_on) g_f3_active = 0;
 
-    bool need = fps_vis || armor_vis || elytra_vis || elytra_angle_vis || f3_vis || g_f3_active ||
+    bool need = n_vis || fps_vis || armor_vis || elytra_vis || elytra_angle_vis || f3_vis || g_f3_active ||
                 zoom_vis || persp_vis || in_settings || g_menu_open || g_edit;
     if (g_frames % 900 == 0 && g_beats < 6) {
         g_beats++;
@@ -962,7 +966,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
                           g_cfg.persp_alpha, false, false, &hud[1]))
                 do_perspective();
         }
-        if (in_settings && !g_menu_open) {
+        if (n_vis) {
             ImVec2 sz = elem_size(E_N);
             if (button_at("##night_n", place(g_cfg.n_x, g_cfg.n_y, sz), sz, pick(LBL_N, NC_COUNT_OF(LBL_N), g_cfg.n_label),
                           g_cfg.n_alpha, true, false, &nrect)) {
