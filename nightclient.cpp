@@ -1,0 +1,886 @@
+/*
+ * Night Client 0.2 - Toolbox mod for Minecraft PE 1.1.5 (32-bit ARM)
+ *
+ * Mods: Autosprint, FPS counter, Armor HUD, Elytra indicator, No hurt cam, Zoom,
+ *       Perspective button, FPS optimizer.
+ * UI:   N button (only in Settings) -> dark menu with a mod list and a config panel,
+ *       plus a "Move on screen" mode where you drag every HUD element with your finger.
+ * All settings are saved to games/com.mojang/NightClient/config.txt
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <float.h>
+#include <math.h>
+#include <time.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
+#include <android/input.h>
+
+#include "imgui.h"
+#include "imgui_impl_opengl3.h"
+
+extern "C" {
+#include "nc_core.h"
+#include "gothook.h"
+}
+#include "nc_font.h"
+
+#define NC_VERSION "0.2"
+#define NC_DIR "/sdcard/games/com.mojang/NightClient/"
+#define NC_CFG NC_DIR "config.txt"
+#define NC_LOG NC_DIR "log.txt"
+
+/* ---- game functions (found in libminecraftpe.so when the mod loads) ---- */
+extern "C" bool mih_isMovingForward(void *self) __asm__("_ZNK16MoveInputHandler15isMovingForwardEv");
+extern "C" bool mob_isSneaking(void *self)      __asm__("_ZNK3Mob10isSneakingEv");
+extern "C" bool mob_isSprinting(void *self)     __asm__("_ZNK3Mob11isSprintingEv");
+extern "C" bool mob_isGliding(void *self)       __asm__("_ZNK3Mob9isGlidingEv");
+extern "C" bool player_isUsingItem(void *self)  __asm__("_ZNK6Player11isUsingItemEv");
+extern "C" void lp_setSprinting(void *self, bool on) __asm__("_ZN11LocalPlayer12setSprintingEb");
+extern "C" const void *mob_getArmor(void *self, int slot) __asm__("_ZNK3Mob8getArmorE9ArmorSlot");
+extern "C" bool ii_isNull(const void *it)       __asm__("_ZNK12ItemInstance6isNullEv");
+extern "C" int  ii_getId(const void *it)        __asm__("_ZNK12ItemInstance5getIdEv");
+extern "C" int  ii_getDamage(const void *it)    __asm__("_ZNK12ItemInstance14getDamageValueEv");
+extern "C" int  ii_getMaxDamage(const void *it) __asm__("_ZNK12ItemInstance12getMaxDamageEv");
+extern "C" void cic_toggle3rd(void *self, void *ci)
+    __asm__("_ZN20ClientInputCallbacks38handleToggleThirdPersonViewButtonPressER14ClientInstance");
+
+/* ---- Toolbox mod loader: hook registration (libmodloader.so) ---- */
+extern "C" void tml_registerHook(const char *symbol, void *hook, void **original)
+    __asm__("_ZN3tml17StaticHookManager12registerHookEPKcPvPS3_");
+
+/* ------------------------------------------------------------------ state */
+static NcConfig g_cfg, g_saved;
+static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;   /* guards g_touch + event queue */
+static NcTouch g_touch;
+static struct { int type; float x, y; } g_q[256];
+static int g_qn = 0;
+
+static void *volatile g_settings_this = 0;   /* the open SettingsScreenController, if any */
+static void *volatile g_cic = 0;             /* ClientInputCallbacks* (captured) */
+static void *volatile g_ci = 0;              /* ClientInstance* (captured) */
+static volatile double g_play_time = 0;      /* last time the gameplay screen was on top */
+static volatile double g_tick_time = 0;      /* last time the local player ticked */
+static volatile int    g_zoom_active = 0;
+static float           g_zoom_cur = 1.0f;
+static struct { volatile int gliding; int present[4], id[4], dur[4], max[4]; } g_snap;
+
+static bool  g_menu_open = false, g_edit = false;
+static int   g_sel = 0;
+static bool  g_imgui_ready = false, g_imgui_failed = false, g_tex_done = false;
+static float g_base = 2.0f;                  /* layout scale chosen from the screen height */
+static float g_w = 1920, g_h = 1080;
+static NcFps g_fps;
+static int   g_log_lines = 0, g_frames = 0, g_beats = 0, g_touch_logged = 0;
+static bool  g_drawing_logged = false, g_gl_err_logged = false;
+
+/* ------------------------------------------------------------------ helpers */
+static void nclog(const char *fmt, ...) {
+    if (g_log_lines > 300) return;
+    g_log_lines++;
+    FILE *f = fopen(NC_LOG, "a");
+    if (!f) return;
+    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+static double now_s() {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+static ImVec2 V(float x, float y) { return ImVec2(x, y); }
+static ImVec2 vadd(ImVec2 a, ImVec2 b) { return ImVec2(a.x + b.x, a.y + b.y); }
+static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static ImU32 rgba(int r, int g, int b, float a) { return IM_COL32(r, g, b, (int)(clampf(a, 0, 1) * 255.0f)); }
+
+/* ------------------------------------------------------------------ game hooks */
+typedef void  (*fn_this)(void *);
+typedef void  (*fn_tick)(void *, void *);
+typedef void  (*fn_apply)(void *, float);
+typedef void  (*fn_bob)(void *, void *, float);
+typedef float (*fn_fov)(void *, float, bool);
+typedef int   (*fn_ptr)(void *, void *, void *, int);
+typedef bool  (*fn_getb)(void *);
+typedef int   (*fn_geti)(void *);
+static fn_this  g_orig_onOpen = 0, g_orig_dtor = 0;
+static fn_tick  g_orig_tick = 0;
+static fn_apply g_orig_apply = 0;
+static fn_bob   g_orig_bob = 0;
+static fn_fov   g_orig_fov = 0;
+static fn_ptr   g_orig_ptr = 0;
+static fn_getb  g_orig_fancy = 0, g_orig_skies = 0, g_orig_light = 0, g_orig_bobview = 0;
+static fn_geti  g_orig_view = 0;
+
+static void hook_settings_open(void *self) {
+    if (g_orig_onOpen) g_orig_onOpen(self);
+    g_settings_this = self;
+    nclog("settings screen opened");
+}
+static void hook_settings_dtor(void *self) {
+    if (self == g_settings_this) { g_settings_this = 0; nclog("settings screen closed"); }
+    if (g_orig_dtor) g_orig_dtor(self);
+}
+
+/* InGamePlayScreen::applyInput(float): runs only while the gameplay screen is on top */
+static void hook_apply(void *self, float dt) {
+    g_play_time = now_s();
+    if (g_orig_apply) g_orig_apply(self, dt);
+}
+
+/* MoveInputHandler::tick(LocalPlayer&): autosprint + data snapshot for the HUD mods */
+static void hook_tick(void *self, void *player) {
+    if (g_orig_tick) g_orig_tick(self, player);
+    if (!player) return;
+    g_tick_time = now_s();
+    if (g_cfg.elytra_on) g_snap.gliding = mob_isGliding(player) ? 1 : 0;
+    if (g_cfg.armor_on) {
+        for (int i = 0; i < 4; i++) {
+            const void *it = mob_getArmor(player, i);
+            if (it && !ii_isNull(it)) {
+                g_snap.id[i] = ii_getId(it);
+                g_snap.max[i] = ii_getMaxDamage(it);
+                g_snap.dur[i] = g_snap.max[i] - ii_getDamage(it);
+                g_snap.present[i] = 1;
+            } else g_snap.present[i] = 0;
+        }
+    }
+    if (g_cfg.autosprint && mih_isMovingForward(self) && !mob_isSneaking(player) &&
+        !player_isUsingItem(player) && !mob_isSprinting(player))
+        lp_setSprinting(player, true);
+}
+
+/* No hurt cam */
+static void hook_bobhurt(void *self, void *m, float t) {
+    if (g_cfg.nohurt) return;
+    if (g_orig_bob) g_orig_bob(self, m, t);
+}
+
+/* Zoom: smoothly divides the field of view */
+static float hook_fov(void *self, float pt, bool isItem) {
+    float f = g_orig_fov ? g_orig_fov(self, pt, isItem) : 70.0f;
+    if (isItem) return f;
+    float target = (g_cfg.zoom_on && g_zoom_active) ? g_cfg.zoom_level : 1.0f;
+    g_zoom_cur += (target - g_zoom_cur) * 0.30f;
+    if (fabsf(target - g_zoom_cur) < 0.01f) g_zoom_cur = target;
+    return g_zoom_cur > 1.001f ? f / g_zoom_cur : f;
+}
+
+/* Perspective button: remember the objects the game's own handler needs */
+static int hook_ptr(void *self, void *ci, void *data, int focus) {
+    g_cic = self; g_ci = ci;
+    return g_orig_ptr ? g_orig_ptr(self, ci, data, focus) : 0;
+}
+
+/* FPS optimizer: change what the game's option getters answer */
+static bool hook_fancy(void *s)   { if (g_cfg.perf_gfx)    return false; return g_orig_fancy   ? g_orig_fancy(s)   : true; }
+static bool hook_skies(void *s)   { if (g_cfg.perf_skies)  return false; return g_orig_skies   ? g_orig_skies(s)   : true; }
+static bool hook_light(void *s)   { if (g_cfg.perf_light)  return false; return g_orig_light   ? g_orig_light(s)   : true; }
+static bool hook_bobview(void *s) { if (g_cfg.perf_bob)    return false; return g_orig_bobview ? g_orig_bobview(s) : true; }
+static int  hook_view(void *s) {
+    int v = g_orig_view ? g_orig_view(s) : 8;
+    if (g_cfg.perf_view_on && v > g_cfg.perf_view) v = g_cfg.perf_view;
+    return v;
+}
+
+/* ------------------------------------------------------------------ touch input */
+typedef int32_t (*getEvent_fn)(AInputQueue *, AInputEvent **);
+static getEvent_fn g_orig_getEvent = 0;
+
+static void push_ev(void *, int type, float x, float y) {
+    if (g_qn < 256) { g_q[g_qn].type = type; g_q[g_qn].x = x; g_q[g_qn].y = y; g_qn++; }
+}
+
+static int32_t hook_getEvent(AInputQueue *q, AInputEvent **out) {
+    for (;;) {
+        int32_t r = g_orig_getEvent(q, out);
+        if (r < 0 || !out || !*out) return r;
+        AInputEvent *ev = *out;
+        if (AInputEvent_getType(ev) == AINPUT_EVENT_TYPE_MOTION) {
+            NcMotion m;
+            int32_t raw = AMotionEvent_getAction(ev);
+            m.action = raw & AMOTION_EVENT_ACTION_MASK;
+            m.idx = (raw & 0xff00) >> 8;
+            int cnt = (int)AMotionEvent_getPointerCount(ev);
+            if (cnt > NC_MAX_PTR) cnt = NC_MAX_PTR;
+            m.count = cnt;
+            for (int i = 0; i < cnt; i++) {
+                m.id[i] = AMotionEvent_getPointerId(ev, (size_t)i);
+                m.x[i] = AMotionEvent_getX(ev, (size_t)i);
+                m.y[i] = AMotionEvent_getY(ev, (size_t)i);
+            }
+            pthread_mutex_lock(&g_mu);
+            int swallow = nc_touch_event(&g_touch, &m, push_ev, 0);
+            pthread_mutex_unlock(&g_mu);
+            if (swallow) {
+                if (g_touch_logged < 6) { g_touch_logged++; nclog("touch taken: action=%d", m.action); }
+                AInputQueue_finishEvent(q, ev, 1);
+                continue;
+            }
+        }
+        return r;
+    }
+}
+
+/* ------------------------------------------------------------------ ImGui setup + theme */
+static const ImVec4 ACCENT(0.50f, 0.42f, 1.00f, 1.00f);
+
+static void apply_theme() {
+    ImGuiStyle &s = ImGui::GetStyle();
+    s.WindowRounding = 10; s.FrameRounding = 6; s.GrabRounding = 6; s.TabRounding = 6;
+    s.ScrollbarRounding = 6; s.ChildRounding = 6; s.PopupRounding = 6;
+    s.WindowBorderSize = 0; s.FrameBorderSize = 0; s.ChildBorderSize = 0;
+    s.WindowPadding = V(12, 10); s.FramePadding = V(10, 6);
+    s.ItemSpacing = V(10, 10); s.ItemInnerSpacing = V(8, 6);
+    s.ScrollbarSize = 12; s.GrabMinSize = 18;
+
+    const ImVec4 accentDim(0.30f, 0.26f, 0.62f, 1.00f);
+    ImVec4 *c = s.Colors;
+    c[ImGuiCol_Text]             = ImVec4(0.92f, 0.92f, 0.96f, 1.00f);
+    c[ImGuiCol_TextDisabled]     = ImVec4(0.52f, 0.52f, 0.64f, 1.00f);
+    c[ImGuiCol_WindowBg]         = ImVec4(0.045f, 0.045f, 0.065f, 0.97f);
+    c[ImGuiCol_ChildBg]          = ImVec4(0.075f, 0.075f, 0.105f, 1.00f);
+    c[ImGuiCol_FrameBg]          = ImVec4(0.12f, 0.12f, 0.17f, 1.00f);
+    c[ImGuiCol_FrameBgHovered]   = ImVec4(0.16f, 0.16f, 0.23f, 1.00f);
+    c[ImGuiCol_FrameBgActive]    = ImVec4(0.19f, 0.18f, 0.30f, 1.00f);
+    c[ImGuiCol_CheckMark]        = ACCENT;
+    c[ImGuiCol_SliderGrab]       = ACCENT;
+    c[ImGuiCol_SliderGrabActive] = ImVec4(0.62f, 0.55f, 1.00f, 1.00f);
+    c[ImGuiCol_Button]           = accentDim;
+    c[ImGuiCol_ButtonHovered]    = ImVec4(0.38f, 0.33f, 0.75f, 1.00f);
+    c[ImGuiCol_ButtonActive]     = ACCENT;
+    c[ImGuiCol_Header]           = ImVec4(0.24f, 0.21f, 0.52f, 1.00f);
+    c[ImGuiCol_HeaderHovered]    = ImVec4(0.30f, 0.26f, 0.62f, 1.00f);
+    c[ImGuiCol_HeaderActive]     = ACCENT;
+    c[ImGuiCol_Separator]        = ImVec4(0.20f, 0.20f, 0.30f, 1.00f);
+    c[ImGuiCol_ScrollbarBg]      = ImVec4(0.03f, 0.03f, 0.05f, 0.60f);
+    c[ImGuiCol_ScrollbarGrab]    = accentDim;
+}
+
+static bool init_imgui(int w, int h) {
+    (void)w;
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO &io = ImGui::GetIO();
+    io.IniFilename = NULL;
+    io.LogFilename = NULL;
+
+    g_base = (float)h / 540.0f;
+    if (g_base < 1.4f) g_base = 1.4f;
+
+    /* the game's own Minecraft font, baked at 8 px and only ever drawn at whole multiples */
+    ImFontConfig fc;
+    fc.FontDataOwnedByAtlas = false;
+    fc.OversampleH = 1; fc.OversampleV = 1; fc.PixelSnapH = true;
+    io.Fonts->AddFontFromMemoryTTF((void *)nc_font_ttf, (int)nc_font_ttf_size, 8.0f, &fc);
+
+    ImGui::StyleColorsDark();
+    apply_theme();
+    ImGui::GetStyle().ScaleAllSizes(g_base);
+
+    if (!ImGui_ImplOpenGL3_Init("#version 100")) { nclog("ImGui GL backend init FAILED"); return false; }
+    nclog("ImGui ready: screen height %d, layout scale %.2f", h, g_base);
+    return true;
+}
+
+static int menu_font_mult(float h) {
+    if (g_cfg.ui_font > 0) return g_cfg.ui_font;
+    int k = (int)floorf(h / 360.0f + 0.5f);
+    return k < 2 ? 2 : (k > 5 ? 5 : k);
+}
+
+/* ------------------------------------------------------------------ HUD elements */
+enum { E_FPS, E_ARMOR, E_ELYTRA, E_ZOOM, E_PERSP, E_N, E_COUNT };
+
+static float fpx(int size) { return 8.0f * (float)size; }
+static ImVec2 txt(const char *s, int size) { return ImGui::GetFont()->CalcTextSizeA(fpx(size), FLT_MAX, 0.0f, s); }
+static void put_text(ImDrawList *dl, ImVec2 p, int size, ImU32 col, const char *s) {
+    dl->AddText(ImGui::GetFont(), fpx(size), V(floorf(p.x), floorf(p.y)), col, s);
+}
+static void box(ImDrawList *dl, ImVec2 p, ImVec2 s, float alpha, int size) {
+    dl->AddRectFilled(p, vadd(p, s), rgba(8, 8, 14, 0.75f * alpha), 2.0f * size);
+}
+static float btn_side(int level) { return floorf(g_h * 0.035f * (float)level); }
+static ImVec2 place(float fx, float fy, ImVec2 sz) { return V(floorf(fx * (g_w - sz.x)), floorf(fy * (g_h - sz.y))); }
+
+/* ---- FPS ---- */
+static ImVec2 size_fps() {
+    ImVec2 t = txt("FPS: 000", g_cfg.fps_size);
+    float pad = 2.0f * g_cfg.fps_size;
+    return V(t.x + 2 * pad, t.y + 2 * pad);
+}
+static void draw_fps(ImDrawList *dl, ImVec2 p, float fps) {
+    char b[24]; snprintf(b, sizeof b, "FPS: %d", (int)(fps + 0.5f));
+    ImVec2 s = size_fps(); float pad = 2.0f * g_cfg.fps_size;
+    if (g_cfg.fps_bg) box(dl, p, s, g_cfg.fps_alpha, g_cfg.fps_size);
+    put_text(dl, V(p.x + pad, p.y + pad), g_cfg.fps_size, rgba(235, 235, 245, g_cfg.fps_alpha), b);
+}
+
+/* ---- Armor HUD ---- */
+struct ArmorRow { int present, id, dur, max, slot; };
+
+static void armor_style(int id, ImU32 *col, float a) {
+    int r = 150, g = 150, b = 165;
+    if      (id >= 298 && id <= 301) { r = 160; g = 100; b = 60; }    /* leather */
+    else if (id >= 302 && id <= 305) { r = 130; g = 135; b = 150; }   /* chain */
+    else if (id >= 306 && id <= 309) { r = 205; g = 205; b = 215; }   /* iron */
+    else if (id >= 310 && id <= 313) { r = 70;  g = 215; b = 215; }   /* diamond */
+    else if (id >= 314 && id <= 317) { r = 235; g = 200; b = 60; }    /* gold */
+    else if (id == 444)              { r = 150; g = 110; b = 230; }   /* elytra */
+    *col = rgba(r, g, b, a);
+}
+static void armor_rows(ArmorRow rows[4], bool preview) {
+    static const int sample_id[4] = { 310, 311, 312, 313 };
+    static const int sample_dur[4] = { 300, 330, 210, 150 };
+    for (int i = 0; i < 4; i++) {
+        if (preview) { rows[i].present = 1; rows[i].id = sample_id[i]; rows[i].max = 363; rows[i].dur = sample_dur[i]; }
+        else { rows[i].present = g_snap.present[i]; rows[i].id = g_snap.id[i]; rows[i].max = g_snap.max[i]; rows[i].dur = g_snap.dur[i]; }
+        rows[i].slot = i;
+    }
+}
+static void armor_metrics(ImVec2 *row, ImVec2 *total) {
+    int s = g_cfg.armor_size;
+    float icon = 10.0f * s, gap = 2.0f * s;
+    float tw = g_cfg.armor_num == 1 ? txt("999/999", s).x : (g_cfg.armor_num == 2 ? txt("100%", s).x : 0.0f);
+    row->x = icon + (tw > 0 ? gap + tw : 0.0f);
+    row->y = icon + (g_cfg.armor_bar ? 3.0f * s : 0.0f);
+    float pad = 2.0f * s;
+    if (g_cfg.armor_horiz) { total->x = 4 * row->x + 3 * gap + 2 * pad; total->y = row->y + 2 * pad; }
+    else                   { total->x = row->x + 2 * pad;              total->y = 4 * row->y + 3 * gap + 2 * pad; }
+}
+static ImVec2 size_armor() { ImVec2 r, t; armor_metrics(&r, &t); return t; }
+
+static void draw_armor(ImDrawList *dl, ImVec2 p, bool preview) {
+    ArmorRow rows[4]; armor_rows(rows, preview);
+    ImVec2 rs, total; armor_metrics(&rs, &total);
+    int s = g_cfg.armor_size; float a = g_cfg.armor_alpha, pad = 2.0f * s, gap = 2.0f * s, icon = 10.0f * s;
+    static const char *letters[4] = { "H", "C", "L", "B" };
+    if (g_cfg.armor_bg) box(dl, p, total, a, s);
+    int shown = 0;
+    for (int i = 0; i < 4; i++) {
+        if (!rows[i].present) continue;
+        ImVec2 o = g_cfg.armor_horiz ? V(pad + shown * (rs.x + gap), pad) : V(pad, pad + shown * (rs.y + gap));
+        ImVec2 q = vadd(p, o);
+        ImU32 col; armor_style(rows[i].id, &col, a);
+        dl->AddRectFilled(q, V(q.x + icon, q.y + icon), col, 1.5f * s);
+        put_text(dl, V(q.x + s, q.y + s), s, rgba(10, 10, 16, a), letters[rows[i].slot]);
+        float frac = rows[i].max > 0 ? clampf((float)rows[i].dur / (float)rows[i].max, 0.0f, 1.0f) : 1.0f;
+        if (g_cfg.armor_num) {
+            char b[16];
+            if (g_cfg.armor_num == 1) snprintf(b, sizeof b, "%d/%d", rows[i].dur, rows[i].max);
+            else                      snprintf(b, sizeof b, "%d%%", (int)(frac * 100.0f + 0.5f));
+            put_text(dl, V(q.x + icon + gap, q.y + (icon - fpx(s)) * 0.5f), s, rgba(235, 235, 245, a), b);
+        }
+        if (g_cfg.armor_bar) {
+            float by = q.y + icon + s;
+            dl->AddRectFilled(V(q.x, by), V(q.x + rs.x, by + 2.0f * s), rgba(40, 40, 55, a));
+            int rr, gg;                                   /* green -> yellow -> red as it wears out */
+            if (frac > 0.5f) { float t = (frac - 0.5f) * 2.0f; rr = (int)(235.0f - 145.0f * t); gg = (int)(215.0f + 15.0f * t); }
+            else             { float t = frac * 2.0f;          rr = 235;                        gg = (int)(70.0f + 145.0f * t); }
+            dl->AddRectFilled(V(q.x, by), V(q.x + rs.x * frac, by + 2.0f * s), rgba(rr, gg, 60, a));
+        }
+        shown++;
+    }
+}
+
+/* ---- Elytra indicator ---- */
+static ImVec2 size_elytra() {
+    ImVec2 t = txt("ELYTRA", g_cfg.elytra_size);
+    float pad = 2.0f * g_cfg.elytra_size;
+    return V(t.x + 2 * pad, t.y + 2 * pad);
+}
+static void draw_elytra(ImDrawList *dl, ImVec2 p) {
+    ImVec2 s = size_elytra(); float pad = 2.0f * g_cfg.elytra_size;
+    box(dl, p, s, g_cfg.elytra_alpha, g_cfg.elytra_size);
+    put_text(dl, V(p.x + pad, p.y + pad), g_cfg.elytra_size, rgba(170, 140, 255, g_cfg.elytra_alpha), "ELYTRA");
+}
+
+/* ---- round/square buttons (N, Zoom, Perspective) ---- */
+static void draw_button(ImDrawList *dl, ImVec2 p, float side, const char *label, float alpha, bool round, bool active) {
+    ImU32 bg = active ? rgba(128, 107, 255, alpha) : rgba(56, 48, 122, alpha);
+    ImVec2 c = V(p.x + side * 0.5f, p.y + side * 0.5f);
+    if (round) dl->AddCircleFilled(c, side * 0.5f, bg);
+    else       dl->AddRectFilled(p, V(p.x + side, p.y + side), bg, side * 0.18f);
+    int lv = (int)floorf(side / 8.0f * 0.5f); if (lv < 1) lv = 1;
+    ImVec2 t = txt(label, lv);
+    put_text(dl, V(c.x - t.x * 0.5f, c.y - t.y * 0.5f), lv, rgba(240, 240, 250, alpha), label);
+}
+
+/* draws one button in its own click window; returns true when it was tapped */
+static bool button_at(const char *id, ImVec2 p, float side, const char *label, float alpha, bool round,
+                      bool active_look, bool *held, NcRect *rect) {
+    ImGui::SetNextWindowPos(p);
+    ImGui::SetNextWindowSize(V(side, side));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, V(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::Begin(id, NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                           ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground);
+    ImGui::SetCursorScreenPos(p);
+    bool pressed = ImGui::InvisibleButton("##b", V(side, side));
+    bool active = ImGui::IsItemActive();
+    if (held) *held = active;
+    draw_button(ImGui::GetWindowDrawList(), p, side, label, alpha, round, active || active_look);
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+    rect->visible = 1; rect->x = p.x; rect->y = p.y; rect->w = side; rect->h = side;
+    return pressed;
+}
+
+/* ---- per-element accessors used by "Move on screen" ---- */
+static int *elem_on(int e) {
+    switch (e) { case E_FPS: return &g_cfg.fps_on; case E_ARMOR: return &g_cfg.armor_on; case E_ELYTRA: return &g_cfg.elytra_on;
+                 case E_ZOOM: return &g_cfg.zoom_on; case E_PERSP: return &g_cfg.persp_on; default: return 0; }
+}
+static float *elem_x(int e) {
+    switch (e) { case E_FPS: return &g_cfg.fps_x; case E_ARMOR: return &g_cfg.armor_x; case E_ELYTRA: return &g_cfg.elytra_x;
+                 case E_ZOOM: return &g_cfg.zoom_x; case E_PERSP: return &g_cfg.persp_x; default: return &g_cfg.n_x; }
+}
+static float *elem_y(int e) {
+    switch (e) { case E_FPS: return &g_cfg.fps_y; case E_ARMOR: return &g_cfg.armor_y; case E_ELYTRA: return &g_cfg.elytra_y;
+                 case E_ZOOM: return &g_cfg.zoom_y; case E_PERSP: return &g_cfg.persp_y; default: return &g_cfg.n_y; }
+}
+static ImVec2 elem_size(int e) {
+    switch (e) {
+        case E_FPS: return size_fps();
+        case E_ARMOR: return size_armor();
+        case E_ELYTRA: return size_elytra();
+        case E_ZOOM: { float s = btn_side(g_cfg.zoom_btn); return V(s, s); }
+        case E_PERSP: { float s = btn_side(g_cfg.persp_btn); return V(s, s); }
+        default: { float s = btn_side(g_cfg.n_btn); return V(s, s); }
+    }
+}
+
+/* ------------------------------------------------------------------ "Move on screen" */
+static void build_edit(float w, float h) {
+    ImGuiIO &io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(V(0, 0));
+    ImGui::SetNextWindowSize(V(w, h));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, V(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::Begin("##night_edit", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                                       ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(V(0, 0), V(w, h), IM_COL32(0, 0, 0, 120));
+
+    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "zoom", "persp", "n" };
+    static const char *lbl[E_COUNT] = { "", "", "", "Z", "P", "N" };
+    for (int e = 0; e < E_COUNT; e++) {
+        int *on = elem_on(e);
+        if (on && !*on) continue;
+        ImVec2 sz = elem_size(e), pos = place(*elem_x(e), *elem_y(e), sz);
+        switch (e) {
+            case E_FPS:    draw_fps(dl, pos, 60.0f); break;
+            case E_ARMOR:  draw_armor(dl, pos, true); break;
+            case E_ELYTRA: draw_elytra(dl, pos); break;
+            default:       draw_button(dl, pos, sz.x, lbl[e], 1.0f, e == E_N, false); break;
+        }
+        dl->AddRect(pos, vadd(pos, sz), IM_COL32(150, 130, 255, 255), 3.0f, 0, 2.0f);
+        ImGui::SetCursorScreenPos(pos);
+        ImGui::InvisibleButton(ids[e], sz);
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0, 0.0f)) {
+            ImVec2 np = V(pos.x + io.MouseDelta.x, pos.y + io.MouseDelta.y);
+            float rx = w - sz.x, ry = h - sz.y;
+            if (rx > 1) *elem_x(e) = clampf(np.x / rx, 0.0f, 1.0f);
+            if (ry > 1) *elem_y(e) = clampf(np.y / ry, 0.0f, 1.0f);
+        }
+    }
+
+    const char *hint = "Drag anything to move it";
+    ImVec2 ht = txt(hint, 3);
+    put_text(dl, V((w - ht.x) * 0.5f, h * 0.06f), 3, IM_COL32(235, 235, 245, 255), hint);
+    float bw = fpx(3) * 5.0f, bh = fpx(3) * 2.4f;
+    ImGui::SetCursorScreenPos(V((w - bw) * 0.5f, h * 0.06f + fpx(3) * 1.8f));
+    if (ImGui::Button("Done", V(bw, bh))) { g_edit = false; g_menu_open = true; nclog("layout saved"); }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+}
+
+/* ------------------------------------------------------------------ menu */
+static void touch_scroll() {
+    ImGuiIO &io = ImGui::GetIO();
+    if (ImGui::IsWindowHovered() && !ImGui::IsAnyItemActive() && ImGui::IsMouseDragging(0))
+        ImGui::SetScrollY(ImGui::GetScrollY() - io.MouseDelta.y);
+}
+static void chk(const char *label, int *v) { bool b = *v != 0; if (ImGui::Checkbox(label, &b)) *v = b ? 1 : 0; }
+static void sl_f(const char *label, float *v, float lo, float hi) { ImGui::SliderFloat(label, v, lo, hi, "%.2f"); }
+static void sl_i(const char *label, int *v, int lo, int hi) { ImGui::SliderInt(label, v, lo, hi, "%d"); }
+static void move_btn() {
+    if (ImGui::Button("Move on screen")) { g_edit = true; g_menu_open = false; nclog("edit mode"); }
+}
+static void head(const char *title, int *on, const char *desc) {
+    ImGui::TextColored(ACCENT, "%s", title);
+    if (on) chk("Enabled", on);
+    if (desc) ImGui::TextDisabled("%s", desc);
+    ImGui::Separator();
+}
+static void hud_look(int *size, float *alpha) {
+    sl_i("Size", size, 1, 8);
+    sl_f("Opacity", alpha, 0.1f, 1.0f);
+}
+static void hud_pos(float *x, float *y) {
+    move_btn();
+    ImGui::TextDisabled("Fine tune");
+    sl_f("X", x, 0.0f, 1.0f);
+    sl_f("Y", y, 0.0f, 1.0f);
+}
+
+static void panel_autosprint() {
+    head("Autosprint", &g_cfg.autosprint, "Sprint automatically while you move forward.");
+}
+static void panel_fps() {
+    head("FPS counter", &g_cfg.fps_on, "Shows your frame rate.");
+    chk("Also show in menus (outside a world)", &g_cfg.fps_menus);
+    chk("Dark background", &g_cfg.fps_bg);
+    hud_look(&g_cfg.fps_size, &g_cfg.fps_alpha);
+    hud_pos(&g_cfg.fps_x, &g_cfg.fps_y);
+}
+static void panel_armor() {
+    head("Armor HUD", &g_cfg.armor_on, "Your armor and its durability. Only shows in a world.");
+    ImGui::TextDisabled("Icons are coloured squares for now. Turn off Toolbox's own armor HUD by removing it from config.json.");
+    chk("Bar", &g_cfg.armor_bar);
+    chk("Dark background", &g_cfg.armor_bg);
+    chk("Lay out sideways", &g_cfg.armor_horiz);
+    if (ImGui::RadioButton("No text", g_cfg.armor_num == 0)) g_cfg.armor_num = 0;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Durability", g_cfg.armor_num == 1)) g_cfg.armor_num = 1;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Percent", g_cfg.armor_num == 2)) g_cfg.armor_num = 2;
+    hud_look(&g_cfg.armor_size, &g_cfg.armor_alpha);
+    hud_pos(&g_cfg.armor_x, &g_cfg.armor_y);
+}
+static void panel_elytra() {
+    head("Elytra indicator", &g_cfg.elytra_on, "Shows ELYTRA on screen while you are gliding.");
+    hud_look(&g_cfg.elytra_size, &g_cfg.elytra_alpha);
+    hud_pos(&g_cfg.elytra_x, &g_cfg.elytra_y);
+}
+static void panel_nohurt() {
+    head("No hurt cam", &g_cfg.nohurt, "Stops the screen from tilting when you take damage.");
+}
+static void panel_zoom() {
+    head("Zoom", &g_cfg.zoom_on, "A Z button in the world. Tap it to zoom in, tap again to zoom out.");
+    sl_f("Zoom level", &g_cfg.zoom_level, 1.5f, 12.0f);
+    sl_i("Button size", &g_cfg.zoom_btn, 1, 8);
+    sl_f("Button opacity", &g_cfg.zoom_alpha, 0.1f, 1.0f);
+    hud_pos(&g_cfg.zoom_x, &g_cfg.zoom_y);
+}
+static void panel_persp() {
+    head("Perspective button", &g_cfg.persp_on, "A P button in the world that switches first/third person.");
+    sl_i("Button size", &g_cfg.persp_btn, 1, 8);
+    sl_f("Button opacity", &g_cfg.persp_alpha, 0.1f, 1.0f);
+    hud_pos(&g_cfg.persp_x, &g_cfg.persp_y);
+    ImGui::TextDisabled("Works after you have touched the screen in a world once.");
+}
+static void panel_perf() {
+    head("FPS optimizer", 0, "Lower some graphics settings for more FPS. Each one is separate.");
+    chk("Fast graphics (opaque leaves)", &g_cfg.perf_gfx);
+    chk("Flat lighting", &g_cfg.perf_light);
+    chk("No fancy skies", &g_cfg.perf_skies);
+    chk("No view bobbing", &g_cfg.perf_bob);
+    chk("Limit view distance", &g_cfg.perf_view_on);
+    if (g_cfg.perf_view_on) sl_i("Max chunks", &g_cfg.perf_view, 2, 16);
+    ImGui::TextDisabled("Some changes show after a moment or when you re-enter the world.");
+}
+static void panel_client() {
+    head("Client", 0, "Menu and N button.");
+    sl_i("Menu text size (0 = auto)", &g_cfg.ui_font, 0, 6);
+    sl_i("N button size", &g_cfg.n_btn, 1, 8);
+    sl_f("N button opacity", &g_cfg.n_alpha, 0.2f, 1.0f);
+    move_btn();
+    ImGui::TextDisabled("N button position");
+    sl_f("N X", &g_cfg.n_x, 0.0f, 1.0f);
+    sl_f("N Y", &g_cfg.n_y, 0.0f, 1.0f);
+    chk("Show N button everywhere (debug)", &g_cfg.n_always);
+    ImGui::Spacing();
+    ImGui::TextDisabled("Night Client " NC_VERSION);
+    ImGui::TextDisabled("Settings: games/com.mojang/NightClient/config.txt");
+}
+
+struct Mod { const char *name; int *on; void (*panel)(); };
+static const Mod g_mods[] = {
+    { "Autosprint",         &g_cfg.autosprint, panel_autosprint },
+    { "FPS counter",        &g_cfg.fps_on,     panel_fps },
+    { "Armor HUD",          &g_cfg.armor_on,   panel_armor },
+    { "Elytra indicator",   &g_cfg.elytra_on,  panel_elytra },
+    { "No hurt cam",        &g_cfg.nohurt,     panel_nohurt },
+    { "Zoom",               &g_cfg.zoom_on,    panel_zoom },
+    { "Perspective button", &g_cfg.persp_on,   panel_persp },
+    { "FPS optimizer",      0,                 panel_perf },
+    { "Client",             0,                 panel_client },
+};
+#define NC_NMODS ((int)(sizeof(g_mods) / sizeof(g_mods[0])))
+
+static void build_menu(float w, float h, NcRect *win_rect) {
+    ImGui::SetNextWindowPos(V(w * 0.5f, h * 0.5f), ImGuiCond_Always, V(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(V(w * 0.84f, h * 0.88f), ImGuiCond_Always);
+    ImGui::Begin("##night_menu", NULL, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                       ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
+                                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
+    win_rect->visible = 1; win_rect->x = p.x; win_rect->y = p.y; win_rect->w = s.x; win_rect->h = s.y;
+
+    /* header: title + X (top right) */
+    ImGui::TextColored(ACCENT, "NIGHT CLIENT");
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s  MCPE 1.1.5", NC_VERSION);
+    float xw = ImGui::GetFrameHeight() * 1.5f;
+    ImGui::SameLine(ImGui::GetWindowWidth() - xw - ImGui::GetStyle().WindowPadding.x);
+    if (ImGui::Button("X", V(xw, 0))) { g_menu_open = false; nclog("menu closed"); }
+    ImGui::Separator();
+
+    /* left: mod list, right: config of the selected mod (like your sketch) */
+    ImVec2 body = ImGui::GetContentRegionAvail();
+    float side_w = body.x * 0.30f;
+    ImGui::BeginChild("##side", V(side_w, body.y), false, 0);
+    touch_scroll();
+    ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, V(0.0f, 0.5f));
+    float rowh = ImGui::GetFrameHeight() * 1.7f;
+    for (int i = 0; i < NC_NMODS; i++) {
+        ImVec2 rp = ImGui::GetCursorScreenPos();
+        float rw = ImGui::GetContentRegionAvail().x;
+        if (ImGui::Selectable(g_mods[i].name, g_sel == i, 0, V(rw, rowh))) g_sel = i;
+        if (g_mods[i].on) {
+            float r = rowh * 0.14f;
+            ImGui::GetWindowDrawList()->AddCircleFilled(V(rp.x + rw - r * 2.5f, rp.y + rowh * 0.5f), r,
+                                                        *g_mods[i].on ? IM_COL32(90, 230, 130, 255) : IM_COL32(90, 90, 110, 255));
+        }
+    }
+    ImGui::PopStyleVar();
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::BeginChild("##panel", V(0, body.y), false, 0);
+    touch_scroll();
+    if (g_sel < 0 || g_sel >= NC_NMODS) g_sel = 0;
+    g_mods[g_sel].panel();
+    ImGui::EndChild();
+    ImGui::End();
+}
+
+/* ------------------------------------------------------------------ per-frame entry (eglSwapBuffers) */
+static void do_perspective() {
+    if (g_cic && g_ci) cic_toggle3rd(g_cic, g_ci);
+    else nclog("perspective: game objects not captured yet (touch the screen in a world first)");
+}
+
+static void nc_frame(EGLDisplay d, EGLSurface s) {
+    if (g_imgui_failed) return;
+
+    EGLint w = 0, h = 0;
+    eglQuerySurface(d, s, EGL_WIDTH, &w);
+    eglQuerySurface(d, s, EGL_HEIGHT, &h);
+    if (w <= 0 || h <= 0) return;
+    g_w = (float)w; g_h = (float)h;
+
+    g_frames++;
+    if (g_frames == 1) nclog("first frame reached our hook: %dx%d", (int)w, (int)h);
+
+    double now = now_s();
+    float fps = nc_fps_frame(&g_fps, now);
+
+    bool in_settings = (g_settings_this != 0) || g_cfg.n_always;
+    bool in_world = (now - g_tick_time) < 0.6;
+    bool play_hud = (now - g_play_time) < 0.3;
+    if (!in_settings) { g_menu_open = false; g_edit = false; }
+
+    bool any_armor = g_snap.present[0] || g_snap.present[1] || g_snap.present[2] || g_snap.present[3];
+    bool fps_vis    = g_cfg.fps_on && (g_cfg.fps_menus || in_world);
+    bool armor_vis  = g_cfg.armor_on && in_world && any_armor && !g_menu_open && !g_edit;
+    bool elytra_vis = g_cfg.elytra_on && in_world && g_snap.gliding && !g_menu_open && !g_edit;
+    bool hud_btns   = play_hud && !in_settings && !g_menu_open && !g_edit;
+    bool zoom_vis   = g_cfg.zoom_on && hud_btns;
+    bool persp_vis  = g_cfg.persp_on && hud_btns;
+    if (!zoom_vis) g_zoom_active = 0;
+
+    bool need = fps_vis || armor_vis || elytra_vis || zoom_vis || persp_vis || in_settings || g_menu_open || g_edit;
+    if (g_frames % 900 == 0 && g_beats < 6) {
+        g_beats++;
+        nclog("heartbeat: frames=%d settings=%d world=%d play=%d menu=%d fps=%.0f", g_frames, g_settings_this != 0,
+              (int)in_world, (int)play_hud, (int)g_menu_open, fps);
+    }
+    if (need && !g_drawing_logged) { g_drawing_logged = true; nclog("drawing started"); }
+
+    if (!need) {
+        pthread_mutex_lock(&g_mu);
+        NcTouch keep_cap = g_touch;                    /* keep the finger id; hide every rect */
+        nc_touch_init(&g_touch); g_touch.cap_id = keep_cap.cap_id;
+        g_qn = 0;
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+
+    if (!g_imgui_ready) {
+        if (!init_imgui(w, h)) { g_imgui_failed = true; return; }
+        g_imgui_ready = true;
+    }
+    ImGuiIO &io = ImGui::GetIO();
+
+    /* touches collected by the input hook */
+    struct { int type; float x, y; } evs[256];
+    int n;
+    pthread_mutex_lock(&g_mu);
+    n = g_qn; memcpy(evs, g_q, sizeof(evs[0]) * n); g_qn = 0;
+    pthread_mutex_unlock(&g_mu);
+    if (n) io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+    for (int i = 0; i < n; i++) {
+        io.AddMousePosEvent(evs[i].x, evs[i].y);
+        if (evs[i].type == NC_EV_DOWN) io.AddMouseButtonEvent(0, true);
+        if (evs[i].type == NC_EV_UP) { io.AddMouseButtonEvent(0, false); io.AddMousePosEvent(-FLT_MAX, -FLT_MAX); }
+    }
+
+    static double last = 0.0;
+    float dt = last > 0.0 ? (float)(now - last) : (1.0f / 60.0f);
+    last = now;
+    if (dt <= 0.0f) dt = 1.0f / 60.0f;
+    if (dt > 0.25f) dt = 0.25f;
+
+    ImGui_ImplOpenGL3_NewFrame();
+    if (!g_tex_done) {           /* crisp pixel font: no smoothing when the texture is enlarged */
+        g_tex_done = true;
+        GLint prev = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
+        glBindTexture(GL_TEXTURE_2D, (GLuint)(uintptr_t)io.Fonts->TexID);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, (GLuint)prev);
+    }
+    io.DisplaySize = V((float)w, (float)h);
+    io.DeltaTime = dt;
+    io.FontGlobalScale = (float)menu_font_mult((float)h);
+    ImGui::NewFrame();
+
+    NcRect hud[NC_MAX_HUD]; memset(hud, 0, sizeof hud);
+    NcRect nrect; memset(&nrect, 0, sizeof nrect);
+    NcRect wrect; memset(&wrect, 0, sizeof wrect);
+    ImDrawList *fg = ImGui::GetForegroundDrawList();
+
+    if (g_edit) {
+        build_edit((float)w, (float)h);
+        wrect.visible = 1; wrect.x = 0; wrect.y = 0; wrect.w = (float)w; wrect.h = (float)h;   /* whole screen is ours */
+    } else {
+        if (fps_vis)    draw_fps(fg, place(g_cfg.fps_x, g_cfg.fps_y, size_fps()), fps);
+        if (armor_vis)  draw_armor(fg, place(g_cfg.armor_x, g_cfg.armor_y, size_armor()), false);
+        if (elytra_vis) draw_elytra(fg, place(g_cfg.elytra_x, g_cfg.elytra_y, size_elytra()));
+
+        if (zoom_vis) {
+            float side = btn_side(g_cfg.zoom_btn);
+            if (button_at("##night_zoom", place(g_cfg.zoom_x, g_cfg.zoom_y, V(side, side)), side, "Z", g_cfg.zoom_alpha,
+                          false, g_zoom_active != 0, 0, &hud[0]))
+                g_zoom_active = g_zoom_active ? 0 : 1;
+        }
+        if (persp_vis) {
+            float side = btn_side(g_cfg.persp_btn);
+            if (button_at("##night_persp", place(g_cfg.persp_x, g_cfg.persp_y, V(side, side)), side, "P", g_cfg.persp_alpha,
+                          false, false, 0, &hud[1]))
+                do_perspective();
+        }
+        if (in_settings && !g_menu_open) {
+            float side = btn_side(g_cfg.n_btn);
+            if (button_at("##night_n", place(g_cfg.n_x, g_cfg.n_y, V(side, side)), side, "N", g_cfg.n_alpha, true, false, 0, &nrect)) {
+                g_menu_open = true; nclog("menu opened");
+            }
+        }
+        if (g_menu_open) build_menu((float)w, (float)h, &wrect);
+    }
+
+    if (!nc_cfg_equal(&g_cfg, &g_saved) && !ImGui::IsMouseDown(0)) {
+        if (nc_cfg_save(&g_cfg, NC_CFG)) g_saved = g_cfg;
+    }
+
+    ImGui::Render();
+
+    GLint prev_fbo = 0;
+    GLboolean prev_mask[4] = { GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE };
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+    glGetBooleanv(GL_COLOR_WRITEMASK, prev_mask);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);                 /* always draw into the real screen */
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    glColorMask(prev_mask[0], prev_mask[1], prev_mask[2], prev_mask[3]);
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
+    GLenum gl_err = glGetError();
+    if (gl_err != GL_NO_ERROR && !g_gl_err_logged) { g_gl_err_logged = true; nclog("GL error 0x%x after drawing", (unsigned)gl_err); }
+
+    pthread_mutex_lock(&g_mu);
+    g_touch.n = nrect; g_touch.win = wrect;
+    for (int i = 0; i < NC_MAX_HUD; i++) g_touch.hud[i] = hud[i];
+    pthread_mutex_unlock(&g_mu);
+}
+
+typedef EGLBoolean (*swap_fn)(EGLDisplay, EGLSurface);
+static swap_fn g_orig_swap = 0;
+static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
+    nc_frame(d, s);
+    return g_orig_swap(d, s);
+}
+
+/* ------------------------------------------------------------------ startup */
+static void *installer(void *) {
+    int swap_done = 0, input_done = 0;
+    for (int i = 0; i < 40 && !(swap_done && input_done); i++) {
+        sleep(1);
+        if (!swap_done) {
+            int n = nc_got_hook("libminecraftpe.so", "eglSwapBuffers", (void *)hook_swap, (void **)&g_orig_swap);
+            if (n > 0 || i == 0) nclog("hook eglSwapBuffers: %d slot(s)", n);
+            swap_done = n > 0;
+        }
+        if (!input_done) {
+            int n = nc_got_hook("libminecraftpe.so", "AInputQueue_getEvent", (void *)hook_getEvent, (void **)&g_orig_getEvent);
+            if (n > 0 || i == 0) nclog("hook AInputQueue_getEvent: %d slot(s)", n);
+            input_done = n > 0;
+        }
+    }
+    nclog("installer finished: draw=%d input=%d", swap_done, input_done);
+    return 0;
+}
+
+static void reg(const char *what, const char *sym, void *hook, void **orig) {
+    tml_registerHook(sym, hook, orig);
+    nclog("registered hook: %s", what);
+}
+
+__attribute__((constructor))
+static void nc_init(void) {
+    mkdir("/sdcard/games/com.mojang/NightClient", 0777);
+    FILE *f = fopen(NC_LOG, "w");
+    if (f) { fputs("Night Client " NC_VERSION " loaded\n", f); fclose(f); }
+
+    nc_touch_init(&g_touch);
+    nc_cfg_defaults(&g_cfg);
+    int had = nc_cfg_load(&g_cfg, NC_CFG);
+    if (!had) nc_cfg_save(&g_cfg, NC_CFG);
+    g_saved = g_cfg;
+    nclog("config %s", had ? "loaded" : "created");
+
+    /* always on: autosprint + data snapshot, settings-screen detection, gameplay-screen detection */
+    reg("player tick", "_ZN16MoveInputHandler4tickER11LocalPlayer", (void *)hook_tick, (void **)&g_orig_tick);
+    reg("settings open", "_ZN24SettingsScreenController6onOpenEv", (void *)hook_settings_open, (void **)&g_orig_onOpen);
+    reg("settings close", "_ZN24SettingsScreenControllerD1Ev", (void *)hook_settings_dtor, (void **)&g_orig_dtor);
+    reg("gameplay screen", "_ZN16InGamePlayScreen10applyInputEf", (void *)hook_apply, (void **)&g_orig_apply);
+
+    /* per mod: can be switched off in config.txt (hook_x=0) if one of them ever crashes the game */
+    if (g_cfg.hook_hurt)  reg("no hurt cam", "_ZN19LevelRendererPlayer7bobHurtER6Matrixf", (void *)hook_bobhurt, (void **)&g_orig_bob);
+    if (g_cfg.hook_fov)   reg("zoom", "_ZN19LevelRendererPlayer6getFovEfb", (void *)hook_fov, (void **)&g_orig_fov);
+    if (g_cfg.hook_persp) reg("perspective",
+        "_ZN20ClientInputCallbacks21handlePointerLocationER14ClientInstanceRK24PointerLocationEventData11FocusImpact",
+        (void *)hook_ptr, (void **)&g_orig_ptr);
+    if (g_cfg.hook_perf) {
+        reg("fast graphics", "_ZNK7Options16getFancyGraphicsEv", (void *)hook_fancy, (void **)&g_orig_fancy);
+        reg("fancy skies", "_ZNK7Options13getFancySkiesEv", (void *)hook_skies, (void **)&g_orig_skies);
+        reg("smooth lighting", "_ZNK7Options17getSmoothLightingEv", (void *)hook_light, (void **)&g_orig_light);
+        reg("view bobbing", "_ZNK7Options10getBobViewEv", (void *)hook_bobview, (void **)&g_orig_bobview);
+        reg("view distance", "_ZNK7Options21getViewDistanceChunksEv", (void *)hook_view, (void **)&g_orig_view);
+    }
+
+    pthread_t t;
+    if (pthread_create(&t, 0, installer, 0) == 0) pthread_detach(t);
+}
+
+extern "C" __attribute__((visibility("default"))) void tml_init(void) {}

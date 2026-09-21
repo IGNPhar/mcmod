@@ -1,0 +1,79 @@
+/* Night Client core: config table, touch capture, FPS meter. Pure C, no game/ImGui deps. */
+#ifndef NC_CORE_H
+#define NC_CORE_H
+#include <stddef.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ---------------- config ----------------
+ * X(name, type, default, min, max)   type: I = int, F = float
+ * To add a setting for a new mod, add ONE line here. It is saved/loaded automatically. */
+#define NC_FIELDS(X) \
+  X(autosprint,   I, 1,    0, 1) \
+  X(fps_on,       I, 0,    0, 1) X(fps_x, F, 0.02, 0, 1) X(fps_y, F, 0.02, 0, 1) X(fps_size, I, 3, 1, 8) \
+  X(fps_alpha,    F, 1.0,  0.1, 1) X(fps_bg, I, 1, 0, 1) X(fps_menus, I, 1, 0, 1) \
+  X(armor_on,     I, 0,    0, 1) X(armor_x, F, 0.02, 0, 1) X(armor_y, F, 0.30, 0, 1) X(armor_size, I, 3, 1, 8) \
+  X(armor_alpha,  F, 1.0,  0.1, 1) X(armor_bg, I, 1, 0, 1) X(armor_bar, I, 1, 0, 1) X(armor_num, I, 1, 0, 2) \
+  X(armor_horiz,  I, 0,    0, 1) \
+  X(elytra_on,    I, 0,    0, 1) X(elytra_x, F, 0.50, 0, 1) X(elytra_y, F, 0.62, 0, 1) X(elytra_size, I, 3, 1, 8) \
+  X(elytra_alpha, F, 1.0,  0.1, 1) \
+  X(nohurt,       I, 0,    0, 1) \
+  X(zoom_on,      I, 0,    0, 1) X(zoom_x, F, 0.90, 0, 1) X(zoom_y, F, 0.30, 0, 1) X(zoom_btn, I, 3, 1, 8) \
+  X(zoom_alpha,   F, 0.85, 0.1, 1) X(zoom_level, F, 4.0, 1.5, 12) \
+  X(persp_on,     I, 0,    0, 1) X(persp_x, F, 0.90, 0, 1) X(persp_y, F, 0.46, 0, 1) X(persp_btn, I, 3, 1, 8) \
+  X(persp_alpha,  F, 0.85, 0.1, 1) \
+  X(perf_gfx,     I, 0,    0, 1) X(perf_light, I, 0, 0, 1) X(perf_skies, I, 0, 0, 1) X(perf_bob, I, 0, 0, 1) \
+  X(perf_view_on, I, 0,    0, 1) X(perf_view, I, 6, 2, 16) \
+  X(ui_font,      I, 0,    0, 6) \
+  X(n_x,          F, 0.92, 0, 1) X(n_y, F, 0.80, 0, 1) X(n_btn, I, 3, 1, 8) X(n_alpha, F, 1.0, 0.2, 1) \
+  X(n_always,     I, 0,    0, 1) \
+  X(hook_hurt,    I, 1,    0, 1) X(hook_fov, I, 1, 0, 1) X(hook_persp, I, 1, 0, 1) X(hook_perf, I, 1, 0, 1)
+
+#define NC_TYPE_I int
+#define NC_TYPE_F float
+#define NC_DECL(n, t, d, mn, mx) NC_TYPE_##t n;
+typedef struct { NC_FIELDS(NC_DECL) } NcConfig;
+
+void nc_cfg_defaults(NcConfig *c);
+int  nc_cfg_load(NcConfig *c, const char *path);       /* returns 1 if the file existed */
+int  nc_cfg_save(const NcConfig *c, const char *path); /* returns 1 on success */
+int  nc_cfg_equal(const NcConfig *a, const NcConfig *b);
+
+/* ---------------- touch capture ---------------- */
+enum { NC_EV_DOWN = 1, NC_EV_MOVE = 2, NC_EV_UP = 3 };
+#define NC_MAX_PTR 10
+#define NC_MAX_HUD 8
+
+typedef struct { int visible; float x, y, w, h; } NcRect;
+typedef struct {
+    NcRect n;                 /* the N button */
+    NcRect win;               /* modal area (menu / edit mode): while visible, every touch is ours */
+    NcRect hud[NC_MAX_HUD];   /* in-game buttons */
+    int    cap_id;            /* pointer id we hold, or -1 */
+} NcTouch;
+
+/* one Android motion event, already unpacked */
+typedef struct {
+    int   action;             /* masked action: 0 down, 1 up, 2 move, 3 cancel, 5 pointer down, 6 pointer up */
+    int   idx;                /* which pointer the action refers to */
+    int   count;
+    int   id[NC_MAX_PTR];
+    float x[NC_MAX_PTR], y[NC_MAX_PTR];
+} NcMotion;
+
+typedef void (*NcPush)(void *user, int type, float x, float y);
+
+void nc_touch_init(NcTouch *t);
+/* Returns 1 if the event must NOT reach the game. Only the finger that pressed one of our
+ * controls is taken; other fingers keep working in the game. */
+int nc_touch_event(NcTouch *t, const NcMotion *m, NcPush push, void *user);
+
+/* ---------------- fps ---------------- */
+typedef struct { double window_start; int frames; float fps; } NcFps;
+float nc_fps_frame(NcFps *f, double now);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
