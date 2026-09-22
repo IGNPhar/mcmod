@@ -17,7 +17,7 @@ extern "C" {
   X(armor_alpha,  F, 1.0,  0.1, 1) X(armor_bg, I, 0, 0, 1) X(armor_bar, I, 0, 0, 1) X(armor_num, I, 1, 0, 2) \
   X(armor_horiz,  I, 0,    0, 1) X(armor_col, I, 0xEBEBF5, 0, 0xFFFFFF) \
   X(arrow_on,     I, 0,    0, 1) X(arrow_x, F, 0.50, 0, 1) X(arrow_y, F, 0.68, 0, 1) X(arrow_size, I, 3, 1, 8) \
-  X(arrow_alpha,  F, 1.0,  0.1, 1) X(arrow_col, I, 0xEBEBF5, 0, 0xFFFFFF) \
+  X(arrow_alpha,  F, 1.0,  0.1, 1) X(arrow_col, I, 0xEBEBF5, 0, 0xFFFFFF) X(arrow_bg, I, 1, 0, 1) \
   X(elytra_on,    I, 1,    0, 1) X(elytra_x, F, 0.50, 0, 1) X(elytra_y, F, 0.56, 0, 1) X(elytra_size, I, 3, 1, 8) X(elytra_style, I, 0, 0, 2) \
   X(elytra_alpha, F, 1.0,  0.1, 1) X(elytra_col, I, 0xAA8CFF, 0, 0xFFFFFF) \
   X(nohurt,       I, 0,    0, 1) \
@@ -34,6 +34,7 @@ extern "C" {
   X(ui_font,      I, 0,    0, 6) \
   X(n_x,          F, 0.92, 0, 1) X(n_y, F, 0.80, 0, 1) X(n_btn, I, 3, 1, 8) X(n_alpha, F, 1.0, 0.2, 1) \
   X(n_always,     I, 0,    0, 1) X(n_label, I, 0, 0, 7) \
+  X(hitbox_on,    I, 0,    0, 1) X(hook_hitbox, I, 1, 0, 1) \
   X(hook_hurt,    I, 1,    0, 1) X(hook_fov, I, 1, 0, 1) X(hook_persp, I, 1, 0, 1) X(hook_perf, I, 1, 0, 1)
 
 #define NC_TYPE_I int

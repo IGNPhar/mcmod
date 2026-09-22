@@ -33,7 +33,7 @@ extern "C" {
 #include "nc_font.h"
 #include "nc_icons.h"
 
-#define NC_VERSION "0.3.2"
+#define NC_VERSION "0.4"
 #define NC_DIR "/sdcard/games/com.mojang/NightClient/"
 #define NC_CFG NC_DIR "config.txt"
 #define NC_LOG NC_DIR "log.txt"
@@ -129,7 +129,7 @@ static fn_apply g_orig_apply = 0;
 static fn_bob   g_orig_bob = 0;
 static fn_fov   g_orig_fov = 0;
 static fn_ptr   g_orig_ptr = 0;
-static fn_getb  g_orig_fancy = 0, g_orig_skies = 0, g_orig_light = 0, g_orig_bobview = 0;
+static fn_getb  g_orig_fancy = 0, g_orig_skies = 0, g_orig_light = 0, g_orig_bobview = 0, g_orig_hitbox = 0;
 static fn_geti  g_orig_view = 0;
 
 static void hook_settings_open(void *self) {
@@ -215,6 +215,7 @@ static bool hook_fancy(void *s)   { if (g_cfg.perf_gfx)    return false; return 
 static bool hook_skies(void *s)   { if (g_cfg.perf_skies)  return false; return g_orig_skies   ? g_orig_skies(s)   : true; }
 static bool hook_light(void *s)   { if (g_cfg.perf_light)  return false; return g_orig_light   ? g_orig_light(s)   : true; }
 static bool hook_bobview(void *s) { if (g_cfg.perf_bob)    return false; return g_orig_bobview ? g_orig_bobview(s) : true; }
+static bool hook_hitbox(void *s)  { if (g_cfg.hitbox_on)   return true;  return g_orig_hitbox  ? g_orig_hitbox(s)  : false; }
 static int  hook_view(void *s) {
     int v = g_orig_view ? g_orig_view(s) : 8;
     if (g_cfg.perf_view_on && v > g_cfg.perf_view) v = g_cfg.perf_view;
@@ -483,12 +484,12 @@ static ImVec2 size_arrow() {
 static void draw_arrow(ImDrawList *dl, ImVec2 p, int count) {
     int s = g_cfg.arrow_size; float a = g_cfg.arrow_alpha, pad = 2.0f * s, icon = 16.0f * icon_k(s);
     ImVec2 sz = size_arrow();
-    box(dl, p, sz, a, s);
+    if (g_cfg.arrow_bg) box(dl, p, sz, a, s);
     draw_icon(dl, NC_ICON_ARROW, V(p.x + pad, p.y + (sz.y - icon) * 0.5f), icon, rgba(255, 255, 255, a));
     char b[8];
     if (count < 0) snprintf(b, sizeof b, "-");            /* count not available yet, see panel note */
     else           snprintf(b, sizeof b, "%d", count);
-    put_text(dl, V(p.x + pad + icon + 2.0f * s, p.y + (sz.y - fpx(s)) * 0.5f), s, packed(g_cfg.arrow_col, a), b);
+    put_text_sh(dl, V(p.x + pad + icon + 2.0f * s, p.y + (sz.y - fpx(s)) * 0.5f), s, packed(g_cfg.arrow_col, a), b, !g_cfg.arrow_bg);
 }
 
 /* ---- round/square buttons (N, Zoom, Perspective) with preset labels ---- */
@@ -687,6 +688,7 @@ static void panel_elytra() {
 }
 static void panel_arrow() {
     head("Arrow HUD", &g_cfg.arrow_on, "Shows while you hold a bow. The arrow count is not wired up yet (was crashing the game) - it shows a dash for now.");
+    chk("Dark background", &g_cfg.arrow_bg);
     color_picker("Number color", &g_cfg.arrow_col);
     hud_look(&g_cfg.arrow_size, &g_cfg.arrow_alpha);
     hud_pos(&g_cfg.arrow_x, &g_cfg.arrow_y);
@@ -713,6 +715,13 @@ static void panel_persp() {
     sl_f("Button opacity", &g_cfg.persp_alpha, 0.1f, 1.0f);
     hud_pos(&g_cfg.persp_x, &g_cfg.persp_y);
     ImGui::TextDisabled("Works after you have touched the screen in a world once.");
+}
+static void panel_hitbox() {
+    head("Hitboxes", &g_cfg.hitbox_on, "Turns on the game's own developer bounding-box renderer.");
+    ImGui::TextDisabled("This shows every entity's and block's box, drawn by the game itself, so it renders");
+    ImGui::TextDisabled("correctly through everything the game already handles (distance, walls, etc).");
+    ImGui::TextDisabled("There is no separate colour for a thrown ender pearl yet - tell me what it looks");
+    ImGui::TextDisabled("like once you can see it and I will try to single it out next.");
 }
 static void panel_perf() {
     head("FPS optimizer", 0, "Lower some graphics settings for more FPS. Each one is separate.");
@@ -762,6 +771,7 @@ static const Mod g_mods[] = {
     { "No hurt cam",        &g_cfg.nohurt,     panel_nohurt },
     { "Zoom",               &g_cfg.zoom_on,    panel_zoom },
     { "Perspective button", &g_cfg.persp_on,   panel_persp },
+    { "Hitboxes",           &g_cfg.hitbox_on,  panel_hitbox },
     { "FPS optimizer",      0,                 panel_perf },
     { "Client",             0,                 panel_client },
 };
@@ -1033,6 +1043,7 @@ static void nc_init(void) {
     if (g_cfg.hook_persp) reg("perspective",
         "_ZN20ClientInputCallbacks21handlePointerLocationER14ClientInstanceRK24PointerLocationEventData11FocusImpact",
         (void *)hook_ptr, (void **)&g_orig_ptr);
+    if (g_cfg.hook_hitbox) reg("hitboxes", "_ZNK7Options25getDevRenderBoundingBoxesEv", (void *)hook_hitbox, (void **)&g_orig_hitbox);
     if (g_cfg.hook_perf) {
         reg("fast graphics", "_ZNK7Options16getFancyGraphicsEv", (void *)hook_fancy, (void **)&g_orig_fancy);
         reg("fancy skies", "_ZNK7Options13getFancySkiesEv", (void *)hook_skies, (void **)&g_orig_skies);
