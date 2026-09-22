@@ -21,6 +21,7 @@ extern "C" {
   X(speed_on,     I, 0,    0, 1) X(speed_x, F, 0.50, 0, 1) X(speed_y, F, 0.74, 0, 1) X(speed_size, I, 3, 1, 8) \
   X(speed_alpha,  F, 1.0,  0.1, 1) X(speed_col, I, 0xEBEBF5, 0, 0xFFFFFF) X(speed_bg, I, 1, 0, 1) \
   X(elytra_on,    I, 1,    0, 1) X(elytra_x, F, 0.50, 0, 1) X(elytra_y, F, 0.56, 0, 1) X(elytra_size, I, 3, 1, 8) X(elytra_style, I, 0, 0, 2) \
+  X(elytra_angle_on, I, 0, 0, 1) X(elytra_angle_x, F, 0.50, 0, 1) X(elytra_angle_y, F, 0.62, 0, 1) X(elytra_angle_size, I, 3, 1, 8) X(elytra_angle_alpha, F, 1.0, 0.1, 1) X(elytra_angle_col, I, 0xEBEBF5, 0, 0xFFFFFF) X(elytra_angle_bg, I, 1, 0, 1) \
   X(elytra_alpha, F, 1.0,  0.1, 1) X(elytra_col, I, 0xAA8CFF, 0, 0xFFFFFF) \
   X(nohurt,       I, 0,    0, 1) \
   X(zoom_on,      I, 0,    0, 1) X(zoom_x, F, 0.90, 0, 1) X(zoom_y, F, 0.30, 0, 1) X(zoom_btn, I, 3, 1, 8) \

@@ -57,6 +57,9 @@ extern "C" void cic_drop(void *self, void *ci)
 extern "C" const void *player_getSelectedItem(void *self) __asm__("_ZNK6Player15getSelectedItemEv");
 extern "C" const float *entity_getPos(void *self) __asm__("_ZNK6Entity6getPosEv");
 
+struct NcVec2 { float x, y; };
+extern "C" void entity_getRotation(NcVec2 *out, void *self) __asm__("_ZNK6Entity11getRotationEv");
+
 /* ---- Toolbox mod loader: hook registration (libmodloader.so) ---- */
 extern "C" void tml_registerHook(const char *symbol, void *hook, void **original)
     __asm__("_ZN3tml17StaticHookManager12registerHookEPKcPvPS3_");
@@ -77,10 +80,11 @@ static volatile double g_play_time = 0;      /* last time the gameplay screen wa
 static volatile double g_tick_time = 0;      /* last time the local player ticked */
 static volatile int    g_zoom_active = 0;
 static float           g_zoom_cur = 1.0f;
-static struct { volatile int gliding; int present[4], id[4], dur[4], max[4]; int holding_bow; float speed_bps; } g_snap;
+static struct { volatile int gliding; int present[4], id[4], dur[4], max[4]; int holding_bow; float speed_bps; int arrow_count; float elytra_angle; int elytra_angle_valid; } g_snap;
 static float g_last_px = 0.0f, g_last_py = 0.0f, g_last_pz = 0.0f;
 static double g_last_pos_time = 0.0;
 static bool g_have_last_pos = false;
+static void *volatile g_inv_proxy = 0;
 
 static bool  g_menu_open = false, g_edit = false;
 static int   g_sel = 0;
@@ -137,6 +141,20 @@ static fn_fov   g_orig_fov = 0;
 static fn_ptr   g_orig_ptr = 0;
 static fn_getb  g_orig_fancy = 0, g_orig_skies = 0, g_orig_light = 0, g_orig_bobview = 0, g_orig_hitbox = 0;
 static fn_geti  g_orig_view = 0;
+
+typedef int (*fn_itemcount)(void *, int, int);
+static fn_itemcount g_orig_itemcount = 0;
+static int hook_itemcount(void *self, int item_id, int aux) {
+    g_inv_proxy = self;
+    return g_orig_itemcount ? g_orig_itemcount(self, item_id, aux) : 0;
+}
+
+static int snapshot_arrow_count() {
+    void *inv = (void *)g_inv_proxy;
+    if (!inv || !g_orig_itemcount) return -1;
+    int n = g_orig_itemcount(inv, 262, 0); /* 262 = arrow */
+    return n < 0 ? 0 : n;
+}
 
 static void hook_settings_open(void *self) {
     if (g_orig_onOpen) g_orig_onOpen(self);
@@ -200,6 +218,18 @@ static void hook_tick(void *self, void *player) {
         g_snap.speed_bps = 0.0f;
         g_have_last_pos = false;
     }
+    if (g_cfg.elytra_angle_on) {
+        NcVec2 rot = {0.0f, 0.0f};
+        entity_getRotation(&rot, player);
+        if (isfinite(rot.x)) {
+            g_snap.elytra_angle = rot.x;
+            g_snap.elytra_angle_valid = 1;
+        } else g_snap.elytra_angle_valid = 0;
+    } else {
+        g_snap.elytra_angle_valid = 0;
+    }
+    if (g_cfg.arrow_on) g_snap.arrow_count = snapshot_arrow_count();
+    else g_snap.arrow_count = -1;
     if (g_cfg.elytra_on) g_snap.gliding = mob_isGliding(player) ? 1 : 0;
     if (g_cfg.arrow_on) {
         const void *held = player_getSelectedItem(player);
@@ -380,7 +410,7 @@ static int menu_font_mult(float h) {
 }
 
 /* ------------------------------------------------------------------ HUD elements */
-enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_SPEED, E_ZOOM, E_PERSP, E_DROP, E_N, E_COUNT };
+enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_SPEED, E_ELYTRA_ANGLE, E_ZOOM, E_PERSP, E_DROP, E_N, E_COUNT };
 
 static float fpx(int size) { return 8.0f * (float)size; }
 static ImVec2 txt(const char *s, int size) { return ImGui::GetFont()->CalcTextSizeA(fpx(size), FLT_MAX, 0.0f, s); }
@@ -520,9 +550,24 @@ static void draw_arrow(ImDrawList *dl, ImVec2 p, int count) {
     if (g_cfg.arrow_bg) box(dl, p, sz, a, s);
     draw_icon(dl, NC_ICON_ARROW, V(p.x + pad, p.y + (sz.y - icon) * 0.5f), icon, rgba(255, 255, 255, a));
     char b[8];
-    if (count < 0) snprintf(b, sizeof b, "-");            /* count not available yet, see panel note */
+    if (count < 0) snprintf(b, sizeof b, "-");
     else           snprintf(b, sizeof b, "%d", count);
     put_text_sh(dl, V(p.x + pad + icon + 2.0f * s, p.y + (sz.y - fpx(s)) * 0.5f), s, packed(g_cfg.arrow_col, a), b, !g_cfg.arrow_bg);
+}
+
+
+/* ---- Elytra angle: actual Entity rotation X (pitch) from the 1.1.5 game object ---- */
+static ImVec2 size_elytra_angle() {
+    int s = g_cfg.elytra_angle_size; float pad = 2.0f * s;
+    ImVec2 t = txt("Angle: -90.0 deg", s);
+    return V(t.x + 2.0f * pad, t.y + 2.0f * pad);
+}
+static void draw_elytra_angle(ImDrawList *dl, ImVec2 p) {
+    int s = g_cfg.elytra_angle_size; float a = g_cfg.elytra_angle_alpha, pad = 2.0f * s;
+    ImVec2 sz = size_elytra_angle();
+    if (g_cfg.elytra_angle_bg) box(dl, p, sz, a, s);
+    char b[32]; snprintf(b, sizeof b, "Angle: %.1f deg", g_snap.elytra_angle);
+    put_text_sh(dl, V(p.x + pad, p.y + pad), s, packed(g_cfg.elytra_angle_col, a), b, !g_cfg.elytra_angle_bg);
 }
 
 /* ---- Speed HUD: horizontal blocks per real second ---- */
@@ -535,11 +580,9 @@ static void draw_speed(ImDrawList *dl, ImVec2 p, float bps) {
     int z = g_cfg.speed_size; float a = g_cfg.speed_alpha, pad = 2.0f * z;
     ImVec2 sz = size_speed();
     if (g_cfg.speed_bg) box(dl, p, sz, a, z);
-    char b[32];
-    snprintf(b, sizeof b, "Speed: %.2f B/s", bps);
+    char b[32]; snprintf(b, sizeof b, "Speed: %.2f B/s", bps);
     put_text_sh(dl, V(p.x + pad, p.y + pad), z, packed(g_cfg.speed_col, a), b, !g_cfg.speed_bg);
 }
-
 
 /* ---- round/square buttons (N, Zoom, Perspective) with preset labels ---- */
 static const char *const LBL_ZOOM[]  = { "Z", "ZOOM", "+", "Q", "O" };
@@ -590,17 +633,17 @@ static bool button_at(const char *id, ImVec2 p, ImVec2 sz, const char *label, fl
 /* ---- per-element accessors used by "Move on screen" ---- */
 static int *elem_on(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_on; case E_ARMOR: return &g_cfg.armor_on; case E_ELYTRA: return &g_cfg.elytra_on;
-                 case E_ARROW: return &g_cfg.arrow_on; case E_SPEED: return &g_cfg.speed_on; case E_ZOOM: return &g_cfg.zoom_on; case E_PERSP: return &g_cfg.persp_on;
+                 case E_ARROW: return &g_cfg.arrow_on; case E_SPEED: return &g_cfg.speed_on; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_on; case E_ZOOM: return &g_cfg.zoom_on; case E_PERSP: return &g_cfg.persp_on;
                  case E_DROP: return &g_cfg.drop_on; default: return 0; }
 }
 static float *elem_x(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_x; case E_ARMOR: return &g_cfg.armor_x; case E_ELYTRA: return &g_cfg.elytra_x;
-                 case E_ARROW: return &g_cfg.arrow_x; case E_SPEED: return &g_cfg.speed_x; case E_ZOOM: return &g_cfg.zoom_x; case E_PERSP: return &g_cfg.persp_x;
+                 case E_ARROW: return &g_cfg.arrow_x; case E_SPEED: return &g_cfg.speed_x; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_x; case E_ZOOM: return &g_cfg.zoom_x; case E_PERSP: return &g_cfg.persp_x;
                  case E_DROP: return &g_cfg.drop_x; default: return &g_cfg.n_x; }
 }
 static float *elem_y(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_y; case E_ARMOR: return &g_cfg.armor_y; case E_ELYTRA: return &g_cfg.elytra_y;
-                 case E_ARROW: return &g_cfg.arrow_y; case E_SPEED: return &g_cfg.speed_y; case E_ZOOM: return &g_cfg.zoom_y; case E_PERSP: return &g_cfg.persp_y;
+                 case E_ARROW: return &g_cfg.arrow_y; case E_SPEED: return &g_cfg.speed_y; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_y; case E_ZOOM: return &g_cfg.zoom_y; case E_PERSP: return &g_cfg.persp_y;
                  case E_DROP: return &g_cfg.drop_y; default: return &g_cfg.n_y; }
 }
 static ImVec2 elem_size(int e) {
@@ -610,6 +653,7 @@ static ImVec2 elem_size(int e) {
         case E_ELYTRA: return size_elytra();
         case E_ARROW: return size_arrow();
         case E_SPEED: return size_speed();
+        case E_ELYTRA_ANGLE: return size_elytra_angle();
         case E_DROP:  return btn_size(pick(LBL_DROP,  NC_COUNT_OF(LBL_DROP),  g_cfg.drop_label),  g_cfg.drop_btn);
         case E_ZOOM:  return btn_size(pick(LBL_ZOOM,  NC_COUNT_OF(LBL_ZOOM),  g_cfg.zoom_label),  g_cfg.zoom_btn);
         case E_PERSP: return btn_size(pick(LBL_PERSP, NC_COUNT_OF(LBL_PERSP), g_cfg.persp_label), g_cfg.persp_btn);
@@ -630,7 +674,7 @@ static void build_edit(float w, float h) {
     ImDrawList *dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(V(0, 0), V(w, h), IM_COL32(0, 0, 0, 120));
 
-    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "arrow", "speed", "zoom", "persp", "drop", "n" };
+    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "arrow", "speed", "elytra_angle", "zoom", "persp", "drop", "n" };
 
     for (int e = 0; e < E_COUNT; e++) {
         int *on = elem_on(e);
@@ -640,8 +684,9 @@ static void build_edit(float w, float h) {
             case E_FPS:    draw_fps(dl, pos, 60.0f); break;
             case E_ARMOR:  draw_armor(dl, pos, true); break;
             case E_ELYTRA: draw_elytra(dl, pos); break;
-            case E_ARROW:  draw_arrow(dl, pos, 42); break;
+            case E_ARROW:  draw_arrow(dl, pos, g_snap.arrow_count < 0 ? 0 : g_snap.arrow_count); break;
             case E_SPEED:  draw_speed(dl, pos, 4.20f); break;
+            case E_ELYTRA_ANGLE: draw_elytra_angle(dl, pos); break;
             case E_DROP:   draw_button(dl, pos, sz, pick(LBL_DROP,  NC_COUNT_OF(LBL_DROP),  g_cfg.drop_label),  1.0f, false, false, g_cfg.drop_col); break;
             case E_ZOOM:   draw_button(dl, pos, sz, pick(LBL_ZOOM,  NC_COUNT_OF(LBL_ZOOM),  g_cfg.zoom_label),  1.0f, false, false, g_cfg.zoom_col); break;
             case E_PERSP:  draw_button(dl, pos, sz, pick(LBL_PERSP, NC_COUNT_OF(LBL_PERSP), g_cfg.persp_label), 1.0f, false, false, g_cfg.persp_col); break;
@@ -738,7 +783,7 @@ static void panel_elytra() {
     hud_pos(&g_cfg.elytra_x, &g_cfg.elytra_y);
 }
 static void panel_arrow() {
-    head("Arrow HUD", &g_cfg.arrow_on, "Shows while you hold a bow. The arrow count is not wired up yet (was crashing the game) - it shows a dash for now.");
+    head("Arrow HUD", &g_cfg.arrow_on, "Shows while you hold a bow, with the total arrows in your inventory.");
     chk("Dark background", &g_cfg.arrow_bg);
     color_picker("Number color", &g_cfg.arrow_col);
     hud_look(&g_cfg.arrow_size, &g_cfg.arrow_alpha);
@@ -750,6 +795,13 @@ static void panel_speed() {
     color_picker("Text color", &g_cfg.speed_col);
     hud_look(&g_cfg.speed_size, &g_cfg.speed_alpha);
     hud_pos(&g_cfg.speed_x, &g_cfg.speed_y);
+}
+static void panel_elytra_angle() {
+    head("Elytra angle", &g_cfg.elytra_angle_on, "Shows your actual flight pitch while gliding.");
+    chk("Dark background", &g_cfg.elytra_angle_bg);
+    color_picker("Text color", &g_cfg.elytra_angle_col);
+    hud_look(&g_cfg.elytra_angle_size, &g_cfg.elytra_angle_alpha);
+    hud_pos(&g_cfg.elytra_angle_x, &g_cfg.elytra_angle_y);
 }
 static void panel_nohurt() {
     head("No hurt cam", &g_cfg.nohurt, "Stops the screen from tilting when you take damage.");
@@ -826,6 +878,7 @@ static const Mod g_mods[] = {
     { "Elytra indicator",   &g_cfg.elytra_on,  panel_elytra },
     { "Arrow HUD",          &g_cfg.arrow_on,   panel_arrow },
     { "Speed indicator",    &g_cfg.speed_on,   panel_speed },
+    { "Elytra angle",       &g_cfg.elytra_angle_on, panel_elytra_angle },
     { "Quick drop",         &g_cfg.drop_on,    panel_drop },
     { "No hurt cam",        &g_cfg.nohurt,     panel_nohurt },
     { "Zoom",               &g_cfg.zoom_on,    panel_zoom },
@@ -916,13 +969,14 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool elytra_vis = g_cfg.elytra_on && in_world && g_snap.gliding && !g_menu_open && !g_edit;
     bool arrow_vis  = g_cfg.arrow_on && in_world && g_snap.holding_bow && !g_menu_open && !g_edit;
     bool speed_vis  = g_cfg.speed_on && in_world && !g_menu_open && !g_edit;
+    bool elytra_angle_vis = g_cfg.elytra_angle_on && in_world && g_snap.gliding && g_snap.elytra_angle_valid && !g_menu_open && !g_edit;
     bool hud_btns   = play_hud && !in_settings && !g_menu_open && !g_edit;         /* the world itself */
     bool zoom_vis   = g_cfg.zoom_on && (hud_btns || (in_pause && g_cfg.zoom_pause && !g_menu_open && !g_edit));
     bool persp_vis  = g_cfg.persp_on && (hud_btns || (in_pause && g_cfg.persp_pause && !g_menu_open && !g_edit));
     bool drop_vis   = g_cfg.drop_on && (hud_btns || (in_pause && g_cfg.drop_pause && !g_menu_open && !g_edit));
     if (!zoom_vis) g_zoom_active = 0;
 
-    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || speed_vis || zoom_vis || persp_vis || drop_vis || menu_reach || g_menu_open || g_edit;
+    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || speed_vis || elytra_angle_vis || zoom_vis || persp_vis || drop_vis || menu_reach || g_menu_open || g_edit;
     if (g_frames % 900 == 0 && g_beats < 6) {
         g_beats++;
         nclog("heartbeat: frames=%d settings=%d pause=%d world=%d play=%d menu=%d fps=%.0f", g_frames, g_settings_this != 0,
@@ -990,8 +1044,9 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
         if (fps_vis)    draw_fps(fg, place(g_cfg.fps_x, g_cfg.fps_y, size_fps()), fps);
         if (armor_vis)  draw_armor(fg, place(g_cfg.armor_x, g_cfg.armor_y, size_armor()), false);
         if (elytra_vis) draw_elytra(fg, place(g_cfg.elytra_x, g_cfg.elytra_y, size_elytra()));
-        if (arrow_vis)  draw_arrow(fg, place(g_cfg.arrow_x, g_cfg.arrow_y, size_arrow()), -1);
+        if (arrow_vis)  draw_arrow(fg, place(g_cfg.arrow_x, g_cfg.arrow_y, size_arrow()), g_snap.arrow_count);
         if (speed_vis)  draw_speed(fg, place(g_cfg.speed_x, g_cfg.speed_y, size_speed()), g_snap.speed_bps);
+        if (elytra_angle_vis) draw_elytra_angle(fg, place(g_cfg.elytra_angle_x, g_cfg.elytra_angle_y, size_elytra_angle()));
 
         if (zoom_vis) {
             ImVec2 sz = elem_size(E_ZOOM);
@@ -1092,6 +1147,7 @@ static void nc_init(void) {
 
     /* always on: autosprint + data snapshot, settings-screen detection, gameplay-screen detection */
     reg("player tick", "_ZN16MoveInputHandler4tickER11LocalPlayer", (void *)hook_tick, (void **)&g_orig_tick);
+    reg("inventory item count", "_ZN20PlayerInventoryProxy12getItemCountEii", (void *)hook_itemcount, (void **)&g_orig_itemcount);
     reg("settings open", "_ZN24SettingsScreenController6onOpenEv", (void *)hook_settings_open, (void **)&g_orig_onOpen);
     reg("settings close", "_ZN24SettingsScreenControllerD1Ev", (void *)hook_settings_dtor, (void **)&g_orig_dtor);
     reg("gameplay screen", "_ZN16InGamePlayScreen10applyInputEf", (void *)hook_apply, (void **)&g_orig_apply);
