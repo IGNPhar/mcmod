@@ -18,7 +18,6 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <dlfcn.h>
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -56,6 +55,7 @@ extern "C" void cic_toggle3rd(void *self, void *ci)
 extern "C" void cic_drop(void *self, void *ci)
     __asm__("_ZN20ClientInputCallbacks21handleDropButtonPressER14ClientInstance");
 extern "C" const void *player_getSelectedItem(void *self) __asm__("_ZNK6Player15getSelectedItemEv");
+extern "C" const float *entity_getPos(void *self) __asm__("_ZNK6Entity6getPosEv");
 
 /* ---- Toolbox mod loader: hook registration (libmodloader.so) ---- */
 extern "C" void tml_registerHook(const char *symbol, void *hook, void **original)
@@ -77,9 +77,10 @@ static volatile double g_play_time = 0;      /* last time the gameplay screen wa
 static volatile double g_tick_time = 0;      /* last time the local player ticked */
 static volatile int    g_zoom_active = 0;
 static float           g_zoom_cur = 1.0f;
-static struct { volatile int gliding; int present[4], id[4], dur[4], max[4]; int holding_bow; float pitch; int pitch_valid; } g_snap;
-static float (*g_mob_pitch)(void *) = 0;
-static bool g_mob_pitch_checked = false;
+static struct { volatile int gliding; int present[4], id[4], dur[4], max[4]; int holding_bow; float speed_bps; } g_snap;
+static float g_last_px = 0.0f, g_last_py = 0.0f, g_last_pz = 0.0f;
+static double g_last_pos_time = 0.0;
+static bool g_have_last_pos = false;
 
 static bool  g_menu_open = false, g_edit = false;
 static int   g_sel = 0;
@@ -177,20 +178,29 @@ static void hook_tick(void *self, void *player) {
     if (g_orig_tick) g_orig_tick(self, player);
     if (!player) return;
     g_tick_time = now_s();
-    if (g_cfg.elytra_on || g_cfg.elytra_angle_on) {
-        g_snap.gliding = mob_isGliding(player) ? 1 : 0;
-        if (!g_mob_pitch_checked) {
-            g_mob_pitch_checked = true;
-            g_mob_pitch = (float (*)(void *))dlsym(RTLD_DEFAULT, "_ZNK3Mob8getPitchEv");
-            if (!g_mob_pitch) nclog("elytra angle: Mob::getPitch() symbol not found");
+    if (g_cfg.speed_on) {
+        const float *pos = entity_getPos(player);
+        double t = g_tick_time;
+        if (pos) {
+            float px = pos[0], py = pos[1], pz = pos[2];
+            if (g_have_last_pos) {
+                double dt = t - g_last_pos_time;
+                if (dt > 0.001 && dt < 1.0) {
+                    float dx = px - g_last_px, dz = pz - g_last_pz;
+                    float dist = sqrtf(dx * dx + dz * dz);
+                    float bps = dist / (float)dt;
+                    if (isfinite(bps)) g_snap.speed_bps = clampf(bps, 0.0f, 1000.0f);
+                }
+            }
+            g_last_px = px; g_last_py = py; g_last_pz = pz;
+            g_last_pos_time = t;
+            g_have_last_pos = true;
         }
-        if (g_mob_pitch) {
-            g_snap.pitch = g_mob_pitch(player);
-            g_snap.pitch_valid = 1;
-        } else {
-            g_snap.pitch_valid = 0;
-        }
+    } else {
+        g_snap.speed_bps = 0.0f;
+        g_have_last_pos = false;
     }
+    if (g_cfg.elytra_on) g_snap.gliding = mob_isGliding(player) ? 1 : 0;
     if (g_cfg.arrow_on) {
         const void *held = player_getSelectedItem(player);
         g_snap.holding_bow = (held && !ii_isNull(held) && ii_getId(held) == 261) ? 1 : 0;   /* 261 = bow */
@@ -370,7 +380,7 @@ static int menu_font_mult(float h) {
 }
 
 /* ------------------------------------------------------------------ HUD elements */
-enum { E_FPS, E_ARMOR, E_ELYTRA, E_ELYTRA_ANGLE, E_ARROW, E_ZOOM, E_PERSP, E_DROP, E_N, E_COUNT };
+enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_SPEED, E_ZOOM, E_PERSP, E_DROP, E_N, E_COUNT };
 
 static float fpx(int size) { return 8.0f * (float)size; }
 static ImVec2 txt(const char *s, int size) { return ImGui::GetFont()->CalcTextSizeA(fpx(size), FLT_MAX, 0.0f, s); }
@@ -498,24 +508,6 @@ static void draw_elytra(ImDrawList *dl, ImVec2 p) {
     if (g_cfg.elytra_style != 0) put_text(dl, V(tx, p.y + (sz.y - fpx(s)) * 0.5f), s, col, "ELYTRA");
 }
 
-/* ---- Elytra angle HUD: player's vertical look angle while gliding ---- */
-static ImVec2 size_elytra_angle() {
-    int s = g_cfg.elytra_angle_size;
-    float pad = 2.0f * s;
-    return V(txt("ANGLE: -90°", s).x + 2.0f * pad, txt("ANGLE: -90°", s).y + 2.0f * pad);
-}
-static void draw_elytra_angle(ImDrawList *dl, ImVec2 p, bool preview) {
-    int s = g_cfg.elytra_angle_size;
-    float a = g_cfg.elytra_angle_alpha, pad = 2.0f * s;
-    ImVec2 sz = size_elytra_angle();
-    ImU32 col = packed(g_cfg.elytra_angle_col, a);
-    if (g_cfg.elytra_angle_bg) box(dl, p, sz, a, s);
-    float angle = preview ? -35.0f : g_snap.pitch;
-    char b[32];
-    snprintf(b, sizeof b, "ANGLE: %d°", (int)floorf(angle + (angle >= 0.0f ? 0.5f : -0.5f)));
-    put_text_sh(dl, V(p.x + pad, p.y + pad), s, col, b, !g_cfg.elytra_angle_bg);
-}
-
 /* ---- Arrow HUD: bow icon + total arrows in your inventory ---- */
 static ImVec2 size_arrow() {
     int s = g_cfg.arrow_size; float pad = 2.0f * s, icon = 16.0f * icon_k(s);
@@ -532,6 +524,22 @@ static void draw_arrow(ImDrawList *dl, ImVec2 p, int count) {
     else           snprintf(b, sizeof b, "%d", count);
     put_text_sh(dl, V(p.x + pad + icon + 2.0f * s, p.y + (sz.y - fpx(s)) * 0.5f), s, packed(g_cfg.arrow_col, a), b, !g_cfg.arrow_bg);
 }
+
+/* ---- Speed HUD: horizontal blocks per real second ---- */
+static ImVec2 size_speed() {
+    int z = g_cfg.speed_size; float pad = 2.0f * z;
+    ImVec2 t = txt("Speed: 99.99 B/s", z);
+    return V(t.x + 2.0f * pad, t.y + 2.0f * pad);
+}
+static void draw_speed(ImDrawList *dl, ImVec2 p, float bps) {
+    int z = g_cfg.speed_size; float a = g_cfg.speed_alpha, pad = 2.0f * z;
+    ImVec2 sz = size_speed();
+    if (g_cfg.speed_bg) box(dl, p, sz, a, z);
+    char b[32];
+    snprintf(b, sizeof b, "Speed: %.2f B/s", bps);
+    put_text_sh(dl, V(p.x + pad, p.y + pad), z, packed(g_cfg.speed_col, a), b, !g_cfg.speed_bg);
+}
+
 
 /* ---- round/square buttons (N, Zoom, Perspective) with preset labels ---- */
 static const char *const LBL_ZOOM[]  = { "Z", "ZOOM", "+", "Q", "O" };
@@ -581,18 +589,18 @@ static bool button_at(const char *id, ImVec2 p, ImVec2 sz, const char *label, fl
 
 /* ---- per-element accessors used by "Move on screen" ---- */
 static int *elem_on(int e) {
-    switch (e) { case E_FPS: return &g_cfg.fps_on; case E_ARMOR: return &g_cfg.armor_on; case E_ELYTRA: return &g_cfg.elytra_on; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_on;
-                 case E_ARROW: return &g_cfg.arrow_on; case E_ZOOM: return &g_cfg.zoom_on; case E_PERSP: return &g_cfg.persp_on;
+    switch (e) { case E_FPS: return &g_cfg.fps_on; case E_ARMOR: return &g_cfg.armor_on; case E_ELYTRA: return &g_cfg.elytra_on;
+                 case E_ARROW: return &g_cfg.arrow_on; case E_SPEED: return &g_cfg.speed_on; case E_ZOOM: return &g_cfg.zoom_on; case E_PERSP: return &g_cfg.persp_on;
                  case E_DROP: return &g_cfg.drop_on; default: return 0; }
 }
 static float *elem_x(int e) {
-    switch (e) { case E_FPS: return &g_cfg.fps_x; case E_ARMOR: return &g_cfg.armor_x; case E_ELYTRA: return &g_cfg.elytra_x; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_x;
-                 case E_ARROW: return &g_cfg.arrow_x; case E_ZOOM: return &g_cfg.zoom_x; case E_PERSP: return &g_cfg.persp_x;
+    switch (e) { case E_FPS: return &g_cfg.fps_x; case E_ARMOR: return &g_cfg.armor_x; case E_ELYTRA: return &g_cfg.elytra_x;
+                 case E_ARROW: return &g_cfg.arrow_x; case E_SPEED: return &g_cfg.speed_x; case E_ZOOM: return &g_cfg.zoom_x; case E_PERSP: return &g_cfg.persp_x;
                  case E_DROP: return &g_cfg.drop_x; default: return &g_cfg.n_x; }
 }
 static float *elem_y(int e) {
-    switch (e) { case E_FPS: return &g_cfg.fps_y; case E_ARMOR: return &g_cfg.armor_y; case E_ELYTRA: return &g_cfg.elytra_y; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_y;
-                 case E_ARROW: return &g_cfg.arrow_y; case E_ZOOM: return &g_cfg.zoom_y; case E_PERSP: return &g_cfg.persp_y;
+    switch (e) { case E_FPS: return &g_cfg.fps_y; case E_ARMOR: return &g_cfg.armor_y; case E_ELYTRA: return &g_cfg.elytra_y;
+                 case E_ARROW: return &g_cfg.arrow_y; case E_SPEED: return &g_cfg.speed_y; case E_ZOOM: return &g_cfg.zoom_y; case E_PERSP: return &g_cfg.persp_y;
                  case E_DROP: return &g_cfg.drop_y; default: return &g_cfg.n_y; }
 }
 static ImVec2 elem_size(int e) {
@@ -600,8 +608,8 @@ static ImVec2 elem_size(int e) {
         case E_FPS: return size_fps();
         case E_ARMOR: return size_armor();
         case E_ELYTRA: return size_elytra();
-        case E_ELYTRA_ANGLE: return size_elytra_angle();
         case E_ARROW: return size_arrow();
+        case E_SPEED: return size_speed();
         case E_DROP:  return btn_size(pick(LBL_DROP,  NC_COUNT_OF(LBL_DROP),  g_cfg.drop_label),  g_cfg.drop_btn);
         case E_ZOOM:  return btn_size(pick(LBL_ZOOM,  NC_COUNT_OF(LBL_ZOOM),  g_cfg.zoom_label),  g_cfg.zoom_btn);
         case E_PERSP: return btn_size(pick(LBL_PERSP, NC_COUNT_OF(LBL_PERSP), g_cfg.persp_label), g_cfg.persp_btn);
@@ -622,7 +630,7 @@ static void build_edit(float w, float h) {
     ImDrawList *dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(V(0, 0), V(w, h), IM_COL32(0, 0, 0, 120));
 
-    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "elytra_angle", "arrow", "zoom", "persp", "drop", "n" };
+    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "arrow", "speed", "zoom", "persp", "drop", "n" };
 
     for (int e = 0; e < E_COUNT; e++) {
         int *on = elem_on(e);
@@ -632,8 +640,8 @@ static void build_edit(float w, float h) {
             case E_FPS:    draw_fps(dl, pos, 60.0f); break;
             case E_ARMOR:  draw_armor(dl, pos, true); break;
             case E_ELYTRA: draw_elytra(dl, pos); break;
-            case E_ELYTRA_ANGLE: draw_elytra_angle(dl, pos, true); break;
             case E_ARROW:  draw_arrow(dl, pos, 42); break;
+            case E_SPEED:  draw_speed(dl, pos, 4.20f); break;
             case E_DROP:   draw_button(dl, pos, sz, pick(LBL_DROP,  NC_COUNT_OF(LBL_DROP),  g_cfg.drop_label),  1.0f, false, false, g_cfg.drop_col); break;
             case E_ZOOM:   draw_button(dl, pos, sz, pick(LBL_ZOOM,  NC_COUNT_OF(LBL_ZOOM),  g_cfg.zoom_label),  1.0f, false, false, g_cfg.zoom_col); break;
             case E_PERSP:  draw_button(dl, pos, sz, pick(LBL_PERSP, NC_COUNT_OF(LBL_PERSP), g_cfg.persp_label), 1.0f, false, false, g_cfg.persp_col); break;
@@ -729,19 +737,19 @@ static void panel_elytra() {
     hud_look(&g_cfg.elytra_size, &g_cfg.elytra_alpha);
     hud_pos(&g_cfg.elytra_x, &g_cfg.elytra_y);
 }
-static void panel_elytra_angle() {
-    head("Elytra angle", &g_cfg.elytra_angle_on, "Shows your vertical look angle while gliding.");
-    chk("Dark background", &g_cfg.elytra_angle_bg);
-    color_picker("Text color", &g_cfg.elytra_angle_col);
-    hud_look(&g_cfg.elytra_angle_size, &g_cfg.elytra_angle_alpha);
-    hud_pos(&g_cfg.elytra_angle_x, &g_cfg.elytra_angle_y);
-}
 static void panel_arrow() {
     head("Arrow HUD", &g_cfg.arrow_on, "Shows while you hold a bow. The arrow count is not wired up yet (was crashing the game) - it shows a dash for now.");
     chk("Dark background", &g_cfg.arrow_bg);
     color_picker("Number color", &g_cfg.arrow_col);
     hud_look(&g_cfg.arrow_size, &g_cfg.arrow_alpha);
     hud_pos(&g_cfg.arrow_x, &g_cfg.arrow_y);
+}
+static void panel_speed() {
+    head("Speed indicator", &g_cfg.speed_on, "Shows your real horizontal movement speed in blocks per second.");
+    chk("Dark background", &g_cfg.speed_bg);
+    color_picker("Text color", &g_cfg.speed_col);
+    hud_look(&g_cfg.speed_size, &g_cfg.speed_alpha);
+    hud_pos(&g_cfg.speed_x, &g_cfg.speed_y);
 }
 static void panel_nohurt() {
     head("No hurt cam", &g_cfg.nohurt, "Stops the screen from tilting when you take damage.");
@@ -816,8 +824,8 @@ static const Mod g_mods[] = {
     { "FPS counter",        &g_cfg.fps_on,     panel_fps },
     { "Armor HUD",          &g_cfg.armor_on,   panel_armor },
     { "Elytra indicator",   &g_cfg.elytra_on,  panel_elytra },
-    { "Elytra angle",       &g_cfg.elytra_angle_on, panel_elytra_angle },
     { "Arrow HUD",          &g_cfg.arrow_on,   panel_arrow },
+    { "Speed indicator",    &g_cfg.speed_on,   panel_speed },
     { "Quick drop",         &g_cfg.drop_on,    panel_drop },
     { "No hurt cam",        &g_cfg.nohurt,     panel_nohurt },
     { "Zoom",               &g_cfg.zoom_on,    panel_zoom },
@@ -906,15 +914,15 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool fps_vis    = g_cfg.fps_on && (g_cfg.fps_menus || in_world);
     bool armor_vis  = g_cfg.armor_on && in_world && any_armor && !g_menu_open && !g_edit;
     bool elytra_vis = g_cfg.elytra_on && in_world && g_snap.gliding && !g_menu_open && !g_edit;
-    bool elytra_angle_vis = g_cfg.elytra_angle_on && in_world && g_snap.gliding && g_snap.pitch_valid && !g_menu_open && !g_edit;
     bool arrow_vis  = g_cfg.arrow_on && in_world && g_snap.holding_bow && !g_menu_open && !g_edit;
+    bool speed_vis  = g_cfg.speed_on && in_world && !g_menu_open && !g_edit;
     bool hud_btns   = play_hud && !in_settings && !g_menu_open && !g_edit;         /* the world itself */
     bool zoom_vis   = g_cfg.zoom_on && (hud_btns || (in_pause && g_cfg.zoom_pause && !g_menu_open && !g_edit));
     bool persp_vis  = g_cfg.persp_on && (hud_btns || (in_pause && g_cfg.persp_pause && !g_menu_open && !g_edit));
     bool drop_vis   = g_cfg.drop_on && (hud_btns || (in_pause && g_cfg.drop_pause && !g_menu_open && !g_edit));
     if (!zoom_vis) g_zoom_active = 0;
 
-    bool need = fps_vis || armor_vis || elytra_vis || elytra_angle_vis || arrow_vis || zoom_vis || persp_vis || drop_vis || menu_reach || g_menu_open || g_edit;
+    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || speed_vis || zoom_vis || persp_vis || drop_vis || menu_reach || g_menu_open || g_edit;
     if (g_frames % 900 == 0 && g_beats < 6) {
         g_beats++;
         nclog("heartbeat: frames=%d settings=%d pause=%d world=%d play=%d menu=%d fps=%.0f", g_frames, g_settings_this != 0,
@@ -982,8 +990,8 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
         if (fps_vis)    draw_fps(fg, place(g_cfg.fps_x, g_cfg.fps_y, size_fps()), fps);
         if (armor_vis)  draw_armor(fg, place(g_cfg.armor_x, g_cfg.armor_y, size_armor()), false);
         if (elytra_vis) draw_elytra(fg, place(g_cfg.elytra_x, g_cfg.elytra_y, size_elytra()));
-        if (elytra_angle_vis) draw_elytra_angle(fg, place(g_cfg.elytra_angle_x, g_cfg.elytra_angle_y, size_elytra_angle()), false);
         if (arrow_vis)  draw_arrow(fg, place(g_cfg.arrow_x, g_cfg.arrow_y, size_arrow()), -1);
+        if (speed_vis)  draw_speed(fg, place(g_cfg.speed_x, g_cfg.speed_y, size_speed()), g_snap.speed_bps);
 
         if (zoom_vis) {
             ImVec2 sz = elem_size(E_ZOOM);
