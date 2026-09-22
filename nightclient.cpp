@@ -33,7 +33,7 @@ extern "C" {
 #include "nc_font.h"
 #include "nc_icons.h"
 
-#define NC_VERSION "0.4.2"
+#define NC_VERSION "0.4.3"
 #define NC_DIR "/sdcard/games/com.mojang/NightClient/"
 #define NC_CFG NC_DIR "config.txt"
 #define NC_LOG NC_DIR "log.txt"
@@ -54,9 +54,6 @@ extern "C" void cic_toggle3rd(void *self, void *ci)
     __asm__("_ZN20ClientInputCallbacks38handleToggleThirdPersonViewButtonPressER14ClientInstance");
 extern "C" void cic_drop(void *self, void *ci)
     __asm__("_ZN20ClientInputCallbacks21handleDropButtonPressER14ClientInstance");
-extern "C" void *ci_getOptions(void *self) __asm__("_ZN14ClientInstance10getOptionsEv");
-extern "C" int   opt_getRenderDebug(void *self) __asm__("_ZNK7Options14getRenderDebugEv");
-extern "C" bool  opt_getDevBoxes(void *self) __asm__("_ZNK7Options25getDevRenderBoundingBoxesEv");
 extern "C" const void *player_getSelectedItem(void *self) __asm__("_ZNK6Player15getSelectedItemEv");
 
 /* ---- Toolbox mod loader: hook registration (libmodloader.so) ---- */
@@ -177,12 +174,6 @@ static void hook_tick(void *self, void *player) {
     if (g_orig_tick) g_orig_tick(self, player);
     if (!player) return;
     g_tick_time = now_s();
-    if (g_cfg.hitbox_on && !g_dbg_logged && g_ci) {
-        g_dbg_logged = true;
-        void *opt = ci_getOptions(g_ci);
-        if (opt) nclog("debug options: renderDebug(raw)=%d devBoxes(raw)=%d",
-                       opt_getRenderDebug(opt), (int)opt_getDevBoxes(opt));
-    }
     if (g_cfg.elytra_on) g_snap.gliding = mob_isGliding(player) ? 1 : 0;
     if (g_cfg.arrow_on) {
         const void *held = player_getSelectedItem(player);
