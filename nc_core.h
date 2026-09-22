@@ -27,6 +27,8 @@ extern "C" {
   X(persp_on,     I, 0,    0, 1) X(persp_x, F, 0.90, 0, 1) X(persp_y, F, 0.46, 0, 1) X(persp_btn, I, 3, 1, 8) \
   X(persp_alpha,  F, 0.85, 0.1, 1) X(persp_label, I, 0, 0, 7) \
   X(persp_col,    I, 0x38306E, 0, 0xFFFFFF) X(persp_pause, I, 0, 0, 1) \
+  X(drop_on,      I, 0,    0, 1) X(drop_x, F, 0.90, 0, 1) X(drop_y, F, 0.62, 0, 1) X(drop_btn, I, 3, 1, 8) \
+  X(drop_alpha,   F, 0.85, 0.1, 1) X(drop_label, I, 0, 0, 7) X(drop_col, I, 0x38306E, 0, 0xFFFFFF) X(drop_pause, I, 0, 0, 1) \
   X(perf_gfx,     I, 0,    0, 1) X(perf_light, I, 0, 0, 1) X(perf_skies, I, 0, 0, 1) X(perf_bob, I, 0, 0, 1) \
   X(perf_view_on, I, 0,    0, 1) X(perf_view, I, 6, 2, 16) \
   X(ui_font,      I, 0,    0, 6) \

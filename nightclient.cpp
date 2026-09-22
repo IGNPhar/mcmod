@@ -33,7 +33,7 @@ extern "C" {
 #include "nc_font.h"
 #include "nc_icons.h"
 
-#define NC_VERSION "0.3"
+#define NC_VERSION "0.3.2"
 #define NC_DIR "/sdcard/games/com.mojang/NightClient/"
 #define NC_CFG NC_DIR "config.txt"
 #define NC_LOG NC_DIR "log.txt"
@@ -52,8 +52,9 @@ extern "C" int  ii_getDamage(const void *it)    __asm__("_ZNK12ItemInstance14get
 extern "C" int  ii_getMaxDamage(const void *it) __asm__("_ZNK12ItemInstance12getMaxDamageEv");
 extern "C" void cic_toggle3rd(void *self, void *ci)
     __asm__("_ZN20ClientInputCallbacks38handleToggleThirdPersonViewButtonPressER14ClientInstance");
-extern "C" void *player_getSupplies(void *self) __asm__("_ZNK6Player11getSuppliesEv");
-extern "C" int   container_getItemCount(void *self, int id, int aux) __asm__("_ZN9Container12getItemCountEii");
+extern "C" void cic_drop(void *self, void *ci)
+    __asm__("_ZN20ClientInputCallbacks21handleDropButtonPressER14ClientInstance");
+extern "C" const void *player_getSelectedItem(void *self) __asm__("_ZNK6Player15getSelectedItemEv");
 
 /* ---- Toolbox mod loader: hook registration (libmodloader.so) ---- */
 extern "C" void tml_registerHook(const char *symbol, void *hook, void **original)
@@ -74,7 +75,7 @@ static volatile double g_play_time = 0;      /* last time the gameplay screen wa
 static volatile double g_tick_time = 0;      /* last time the local player ticked */
 static volatile int    g_zoom_active = 0;
 static float           g_zoom_cur = 1.0f;
-static struct { volatile int gliding; int present[4], id[4], dur[4], max[4]; int arrows; } g_snap;
+static struct { volatile int gliding; int present[4], id[4], dur[4], max[4]; int holding_bow; } g_snap;
 
 static bool  g_menu_open = false, g_edit = false;
 static int   g_sel = 0;
@@ -168,8 +169,8 @@ static void hook_tick(void *self, void *player) {
     g_tick_time = now_s();
     if (g_cfg.elytra_on) g_snap.gliding = mob_isGliding(player) ? 1 : 0;
     if (g_cfg.arrow_on) {
-        void *supplies = player_getSupplies(player);
-        g_snap.arrows = supplies ? container_getItemCount(supplies, 262, 0) : 0;   /* 262 = arrow */
+        const void *held = player_getSelectedItem(player);
+        g_snap.holding_bow = (held && !ii_isNull(held) && ii_getId(held) == 261) ? 1 : 0;   /* 261 = bow */
     }
     if (g_cfg.armor_on) {
         for (int i = 0; i < 4; i++) {
@@ -345,7 +346,7 @@ static int menu_font_mult(float h) {
 }
 
 /* ------------------------------------------------------------------ HUD elements */
-enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_ZOOM, E_PERSP, E_N, E_COUNT };
+enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_ZOOM, E_PERSP, E_DROP, E_N, E_COUNT };
 
 static float fpx(int size) { return 8.0f * (float)size; }
 static ImVec2 txt(const char *s, int size) { return ImGui::GetFont()->CalcTextSizeA(fpx(size), FLT_MAX, 0.0f, s); }
@@ -484,7 +485,9 @@ static void draw_arrow(ImDrawList *dl, ImVec2 p, int count) {
     ImVec2 sz = size_arrow();
     box(dl, p, sz, a, s);
     draw_icon(dl, NC_ICON_ARROW, V(p.x + pad, p.y + (sz.y - icon) * 0.5f), icon, rgba(255, 255, 255, a));
-    char b[8]; snprintf(b, sizeof b, "%d", count);
+    char b[8];
+    if (count < 0) snprintf(b, sizeof b, "-");            /* count not available yet, see panel note */
+    else           snprintf(b, sizeof b, "%d", count);
     put_text(dl, V(p.x + pad + icon + 2.0f * s, p.y + (sz.y - fpx(s)) * 0.5f), s, packed(g_cfg.arrow_col, a), b);
 }
 
@@ -492,6 +495,7 @@ static void draw_arrow(ImDrawList *dl, ImVec2 p, int count) {
 static const char *const LBL_ZOOM[]  = { "Z", "ZOOM", "+", "Q", "O" };
 static const char *const LBL_PERSP[] = { "F5", "P", "CAM", "3P", "V" };
 static const char *const LBL_N[]     = { "N", "NC", "NIGHT" };
+static const char *const LBL_DROP[]  = { "Q", "DROP", "V" };
 #define NC_COUNT_OF(a) ((int)(sizeof(a) / sizeof((a)[0])))
 static const char *pick(const char *const *list, int n, int idx) { return list[(idx < 0 || idx >= n) ? 0 : idx]; }
 static int label_level(float side) { int lv = (int)floorf(side / 8.0f * 0.5f); return lv < 1 ? 1 : lv; }
@@ -536,15 +540,18 @@ static bool button_at(const char *id, ImVec2 p, ImVec2 sz, const char *label, fl
 /* ---- per-element accessors used by "Move on screen" ---- */
 static int *elem_on(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_on; case E_ARMOR: return &g_cfg.armor_on; case E_ELYTRA: return &g_cfg.elytra_on;
-                 case E_ARROW: return &g_cfg.arrow_on; case E_ZOOM: return &g_cfg.zoom_on; case E_PERSP: return &g_cfg.persp_on; default: return 0; }
+                 case E_ARROW: return &g_cfg.arrow_on; case E_ZOOM: return &g_cfg.zoom_on; case E_PERSP: return &g_cfg.persp_on;
+                 case E_DROP: return &g_cfg.drop_on; default: return 0; }
 }
 static float *elem_x(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_x; case E_ARMOR: return &g_cfg.armor_x; case E_ELYTRA: return &g_cfg.elytra_x;
-                 case E_ARROW: return &g_cfg.arrow_x; case E_ZOOM: return &g_cfg.zoom_x; case E_PERSP: return &g_cfg.persp_x; default: return &g_cfg.n_x; }
+                 case E_ARROW: return &g_cfg.arrow_x; case E_ZOOM: return &g_cfg.zoom_x; case E_PERSP: return &g_cfg.persp_x;
+                 case E_DROP: return &g_cfg.drop_x; default: return &g_cfg.n_x; }
 }
 static float *elem_y(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_y; case E_ARMOR: return &g_cfg.armor_y; case E_ELYTRA: return &g_cfg.elytra_y;
-                 case E_ARROW: return &g_cfg.arrow_y; case E_ZOOM: return &g_cfg.zoom_y; case E_PERSP: return &g_cfg.persp_y; default: return &g_cfg.n_y; }
+                 case E_ARROW: return &g_cfg.arrow_y; case E_ZOOM: return &g_cfg.zoom_y; case E_PERSP: return &g_cfg.persp_y;
+                 case E_DROP: return &g_cfg.drop_y; default: return &g_cfg.n_y; }
 }
 static ImVec2 elem_size(int e) {
     switch (e) {
@@ -552,6 +559,7 @@ static ImVec2 elem_size(int e) {
         case E_ARMOR: return size_armor();
         case E_ELYTRA: return size_elytra();
         case E_ARROW: return size_arrow();
+        case E_DROP:  return btn_size(pick(LBL_DROP,  NC_COUNT_OF(LBL_DROP),  g_cfg.drop_label),  g_cfg.drop_btn);
         case E_ZOOM:  return btn_size(pick(LBL_ZOOM,  NC_COUNT_OF(LBL_ZOOM),  g_cfg.zoom_label),  g_cfg.zoom_btn);
         case E_PERSP: return btn_size(pick(LBL_PERSP, NC_COUNT_OF(LBL_PERSP), g_cfg.persp_label), g_cfg.persp_btn);
         default:      return btn_size(pick(LBL_N,     NC_COUNT_OF(LBL_N),     g_cfg.n_label),     g_cfg.n_btn);
@@ -571,7 +579,7 @@ static void build_edit(float w, float h) {
     ImDrawList *dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(V(0, 0), V(w, h), IM_COL32(0, 0, 0, 120));
 
-    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "arrow", "zoom", "persp", "n" };
+    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "arrow", "zoom", "persp", "drop", "n" };
 
     for (int e = 0; e < E_COUNT; e++) {
         int *on = elem_on(e);
@@ -582,6 +590,7 @@ static void build_edit(float w, float h) {
             case E_ARMOR:  draw_armor(dl, pos, true); break;
             case E_ELYTRA: draw_elytra(dl, pos); break;
             case E_ARROW:  draw_arrow(dl, pos, 42); break;
+            case E_DROP:   draw_button(dl, pos, sz, pick(LBL_DROP,  NC_COUNT_OF(LBL_DROP),  g_cfg.drop_label),  1.0f, false, false, g_cfg.drop_col); break;
             case E_ZOOM:   draw_button(dl, pos, sz, pick(LBL_ZOOM,  NC_COUNT_OF(LBL_ZOOM),  g_cfg.zoom_label),  1.0f, false, false, g_cfg.zoom_col); break;
             case E_PERSP:  draw_button(dl, pos, sz, pick(LBL_PERSP, NC_COUNT_OF(LBL_PERSP), g_cfg.persp_label), 1.0f, false, false, g_cfg.persp_col); break;
             default:       draw_button(dl, pos, sz, pick(LBL_N,     NC_COUNT_OF(LBL_N),     g_cfg.n_label),     1.0f, true,  false, 0x38306E); break;
@@ -677,7 +686,7 @@ static void panel_elytra() {
     hud_pos(&g_cfg.elytra_x, &g_cfg.elytra_y);
 }
 static void panel_arrow() {
-    head("Arrow HUD", &g_cfg.arrow_on, "A bow icon and the total arrows in your inventory. Only shows in a world.");
+    head("Arrow HUD", &g_cfg.arrow_on, "Shows while you hold a bow. The arrow count is not wired up yet (was crashing the game) - it shows a dash for now.");
     color_picker("Number color", &g_cfg.arrow_col);
     hud_look(&g_cfg.arrow_size, &g_cfg.arrow_alpha);
     hud_pos(&g_cfg.arrow_x, &g_cfg.arrow_y);
@@ -715,6 +724,16 @@ static void panel_perf() {
     if (g_cfg.perf_view_on) sl_i("Max chunks", &g_cfg.perf_view, 2, 16);
     ImGui::TextDisabled("Some changes show after a moment or when you re-enter the world.");
 }
+static void panel_drop() {
+    head("Quick drop", &g_cfg.drop_on, "A button that drops the item you're holding, one tap.");
+    label_btn(LBL_DROP, NC_COUNT_OF(LBL_DROP), &g_cfg.drop_label);
+    color_picker("Button color", &g_cfg.drop_col);
+    chk("Also show on the pause screen", &g_cfg.drop_pause);
+    sl_i("Button size", &g_cfg.drop_btn, 1, 8);
+    sl_f("Button opacity", &g_cfg.drop_alpha, 0.1f, 1.0f);
+    hud_pos(&g_cfg.drop_x, &g_cfg.drop_y);
+    ImGui::TextDisabled("Works after you have touched the screen in a world once.");
+}
 static void panel_client() {
     head("Client", 0, "Menu and N button.");
     sl_i("Menu text size (0 = auto)", &g_cfg.ui_font, 0, 6);
@@ -739,6 +758,7 @@ static const Mod g_mods[] = {
     { "Armor HUD",          &g_cfg.armor_on,   panel_armor },
     { "Elytra indicator",   &g_cfg.elytra_on,  panel_elytra },
     { "Arrow HUD",          &g_cfg.arrow_on,   panel_arrow },
+    { "Quick drop",         &g_cfg.drop_on,    panel_drop },
     { "No hurt cam",        &g_cfg.nohurt,     panel_nohurt },
     { "Zoom",               &g_cfg.zoom_on,    panel_zoom },
     { "Perspective button", &g_cfg.persp_on,   panel_persp },
@@ -825,13 +845,14 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool fps_vis    = g_cfg.fps_on && (g_cfg.fps_menus || in_world);
     bool armor_vis  = g_cfg.armor_on && in_world && any_armor && !g_menu_open && !g_edit;
     bool elytra_vis = g_cfg.elytra_on && in_world && g_snap.gliding && !g_menu_open && !g_edit;
-    bool arrow_vis  = g_cfg.arrow_on && in_world && g_snap.arrows > 0 && !g_menu_open && !g_edit;
+    bool arrow_vis  = g_cfg.arrow_on && in_world && g_snap.holding_bow && !g_menu_open && !g_edit;
     bool hud_btns   = play_hud && !in_settings && !g_menu_open && !g_edit;         /* the world itself */
     bool zoom_vis   = g_cfg.zoom_on && (hud_btns || (in_pause && g_cfg.zoom_pause && !g_menu_open && !g_edit));
     bool persp_vis  = g_cfg.persp_on && (hud_btns || (in_pause && g_cfg.persp_pause && !g_menu_open && !g_edit));
+    bool drop_vis   = g_cfg.drop_on && (hud_btns || (in_pause && g_cfg.drop_pause && !g_menu_open && !g_edit));
     if (!zoom_vis) g_zoom_active = 0;
 
-    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || zoom_vis || persp_vis || menu_reach || g_menu_open || g_edit;
+    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || zoom_vis || persp_vis || drop_vis || menu_reach || g_menu_open || g_edit;
     if (g_frames % 900 == 0 && g_beats < 6) {
         g_beats++;
         nclog("heartbeat: frames=%d settings=%d pause=%d world=%d play=%d menu=%d fps=%.0f", g_frames, g_settings_this != 0,
@@ -899,7 +920,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
         if (fps_vis)    draw_fps(fg, place(g_cfg.fps_x, g_cfg.fps_y, size_fps()), fps);
         if (armor_vis)  draw_armor(fg, place(g_cfg.armor_x, g_cfg.armor_y, size_armor()), false);
         if (elytra_vis) draw_elytra(fg, place(g_cfg.elytra_x, g_cfg.elytra_y, size_elytra()));
-        if (arrow_vis)  draw_arrow(fg, place(g_cfg.arrow_x, g_cfg.arrow_y, size_arrow()), g_snap.arrows);
+        if (arrow_vis)  draw_arrow(fg, place(g_cfg.arrow_x, g_cfg.arrow_y, size_arrow()), -1);
 
         if (zoom_vis) {
             ImVec2 sz = elem_size(E_ZOOM);
@@ -912,6 +933,12 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
             if (button_at("##night_persp", place(g_cfg.persp_x, g_cfg.persp_y, sz), sz, pick(LBL_PERSP, NC_COUNT_OF(LBL_PERSP), g_cfg.persp_label),
                           g_cfg.persp_alpha, false, false, g_cfg.persp_col, &hud[1]))
                 do_perspective();
+        }
+        if (drop_vis) {
+            ImVec2 sz = elem_size(E_DROP);
+            if (button_at("##night_drop", place(g_cfg.drop_x, g_cfg.drop_y, sz), sz, pick(LBL_DROP, NC_COUNT_OF(LBL_DROP), g_cfg.drop_label),
+                          g_cfg.drop_alpha, false, false, g_cfg.drop_col, &hud[2]))
+                { if (g_cic && g_ci) cic_drop(g_cic, g_ci); else nclog("drop: game objects not captured yet"); }
         }
         if (menu_reach && !g_menu_open) {
             ImVec2 sz = elem_size(E_N);
