@@ -56,8 +56,14 @@ extern "C" void cic_drop(void *self, void *ci)
     __asm__("_ZN20ClientInputCallbacks21handleDropButtonPressER14ClientInstance");
 extern "C" const void *player_getSelectedItem(void *self) __asm__("_ZNK6Player15getSelectedItemEv");
 extern "C" const float *entity_getPos(void *self) __asm__("_ZNK6Entity6getPosEv");
-extern "C" void *entity_getInventory(void *self) __asm__("_ZN6Entity12getInventoryEv");
-extern "C" int inventory_getItemCount(void *self, int item_id, int aux) __asm__("_ZN20PlayerInventoryProxy12getItemCountEii");
+/*
+ * Arrow inventory access is intentionally not called yet.
+ *
+ * The previous implementation used Entity::getInventory() and
+ * PlayerInventoryProxy::getItemCount(), but that combination is not ABI-safe
+ * on the exact 1.1.5 binary and caused a crash when entering a world.
+ * Keep the HUD itself alive while we use a verified inventory path.
+ */
 
 struct NcVec2 { float x, y; };
 extern "C" void entity_getRotation(NcVec2 *out, void *self) __asm__("_ZNK6Entity11getRotationEv");
@@ -144,11 +150,16 @@ static fn_getb  g_orig_fancy = 0, g_orig_skies = 0, g_orig_light = 0, g_orig_bob
 static fn_geti  g_orig_view = 0;
 
 static int snapshot_arrow_count(void *player) {
-    if (!player) return -1;
-    void *inv = entity_getInventory(player);
-    if (!inv) return -1;
-    int n = inventory_getItemCount(inv, 262, 0); /* 262 = arrow */
-    return n < 0 ? 0 : n;
+    /*
+     * Do not call the unverified 1.1.5 inventory APIs here.
+     *
+     * Returning -1 keeps the HUD in its old "not yet available" state rather
+     * than touching an incompatible inventory object and crashing the client.
+     * The actual total-arrow-count path will be added only after its ABI is
+     * verified against this exact 1.1.5 libminecraftpe.so.
+     */
+    (void)player;
+    return -1;
 }
 
 static void hook_settings_open(void *self) {
@@ -679,7 +690,7 @@ static void build_edit(float w, float h) {
             case E_FPS:    draw_fps(dl, pos, 60.0f); break;
             case E_ARMOR:  draw_armor(dl, pos, true); break;
             case E_ELYTRA: draw_elytra(dl, pos); break;
-            case E_ARROW:  draw_arrow(dl, pos, g_snap.arrow_count < 0 ? 0 : g_snap.arrow_count); break;
+            case E_ARROW:  draw_arrow(dl, pos, g_snap.arrow_count < 0 ? -1 : g_snap.arrow_count); break;
             case E_SPEED:  draw_speed(dl, pos, 4.20f); break;
             case E_ELYTRA_ANGLE: draw_elytra_angle(dl, pos); break;
             case E_DROP:   draw_button(dl, pos, sz, pick(LBL_DROP,  NC_COUNT_OF(LBL_DROP),  g_cfg.drop_label),  1.0f, false, false, g_cfg.drop_col); break;
