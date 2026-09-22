@@ -56,6 +56,8 @@ extern "C" void cic_drop(void *self, void *ci)
     __asm__("_ZN20ClientInputCallbacks21handleDropButtonPressER14ClientInstance");
 extern "C" const void *player_getSelectedItem(void *self) __asm__("_ZNK6Player15getSelectedItemEv");
 extern "C" const float *entity_getPos(void *self) __asm__("_ZNK6Entity6getPosEv");
+extern "C" void *entity_getInventory(void *self) __asm__("_ZN6Entity12getInventoryEv");
+extern "C" int inventory_getItemCount(void *self, int item_id, int aux) __asm__("_ZN20PlayerInventoryProxy12getItemCountEii");
 
 struct NcVec2 { float x, y; };
 extern "C" void entity_getRotation(NcVec2 *out, void *self) __asm__("_ZNK6Entity11getRotationEv");
@@ -84,7 +86,6 @@ static struct { volatile int gliding; int present[4], id[4], dur[4], max[4]; int
 static float g_last_px = 0.0f, g_last_py = 0.0f, g_last_pz = 0.0f;
 static double g_last_pos_time = 0.0;
 static bool g_have_last_pos = false;
-static void *volatile g_inv_proxy = 0;
 
 static bool  g_menu_open = false, g_edit = false;
 static int   g_sel = 0;
@@ -142,17 +143,11 @@ static fn_ptr   g_orig_ptr = 0;
 static fn_getb  g_orig_fancy = 0, g_orig_skies = 0, g_orig_light = 0, g_orig_bobview = 0, g_orig_hitbox = 0;
 static fn_geti  g_orig_view = 0;
 
-typedef int (*fn_itemcount)(void *, int, int);
-static fn_itemcount g_orig_itemcount = 0;
-static int hook_itemcount(void *self, int item_id, int aux) {
-    g_inv_proxy = self;
-    return g_orig_itemcount ? g_orig_itemcount(self, item_id, aux) : 0;
-}
-
-static int snapshot_arrow_count() {
-    void *inv = (void *)g_inv_proxy;
-    if (!inv || !g_orig_itemcount) return -1;
-    int n = g_orig_itemcount(inv, 262, 0); /* 262 = arrow */
+static int snapshot_arrow_count(void *player) {
+    if (!player) return -1;
+    void *inv = entity_getInventory(player);
+    if (!inv) return -1;
+    int n = inventory_getItemCount(inv, 262, 0); /* 262 = arrow */
     return n < 0 ? 0 : n;
 }
 
@@ -228,7 +223,7 @@ static void hook_tick(void *self, void *player) {
     } else {
         g_snap.elytra_angle_valid = 0;
     }
-    if (g_cfg.arrow_on) g_snap.arrow_count = snapshot_arrow_count();
+    if (g_cfg.arrow_on) g_snap.arrow_count = snapshot_arrow_count(player);
     else g_snap.arrow_count = -1;
     if (g_cfg.elytra_on) g_snap.gliding = mob_isGliding(player) ? 1 : 0;
     if (g_cfg.arrow_on) {
@@ -1147,7 +1142,6 @@ static void nc_init(void) {
 
     /* always on: autosprint + data snapshot, settings-screen detection, gameplay-screen detection */
     reg("player tick", "_ZN16MoveInputHandler4tickER11LocalPlayer", (void *)hook_tick, (void **)&g_orig_tick);
-    reg("inventory item count", "_ZN20PlayerInventoryProxy12getItemCountEii", (void *)hook_itemcount, (void **)&g_orig_itemcount);
     reg("settings open", "_ZN24SettingsScreenController6onOpenEv", (void *)hook_settings_open, (void **)&g_orig_onOpen);
     reg("settings close", "_ZN24SettingsScreenControllerD1Ev", (void *)hook_settings_dtor, (void **)&g_orig_dtor);
     reg("gameplay screen", "_ZN16InGamePlayScreen10applyInputEf", (void *)hook_apply, (void **)&g_orig_apply);
