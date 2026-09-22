@@ -33,7 +33,7 @@ extern "C" {
 #include "nc_font.h"
 #include "nc_icons.h"
 
-#define NC_VERSION "0.4.1"
+#define NC_VERSION "0.4.2"
 #define NC_DIR "/sdcard/games/com.mojang/NightClient/"
 #define NC_CFG NC_DIR "config.txt"
 #define NC_LOG NC_DIR "log.txt"
@@ -74,6 +74,7 @@ static void *volatile g_settings_this = 0;   /* the open SettingsScreenControlle
 static void *volatile g_pause_this = 0;      /* the open PauseScreenController, if any */
 static void *volatile g_cic = 0;             /* ClientInputCallbacks* (captured) */
 static void *volatile g_ci = 0;              /* ClientInstance* (captured) */
+static void *g_apply_self = 0;               /* which gameplay screen instance g_ci was captured for */
 static volatile double g_play_time = 0;      /* last time the gameplay screen was on top */
 static volatile double g_tick_time = 0;      /* last time the local player ticked */
 static volatile int    g_zoom_active = 0;
@@ -163,6 +164,11 @@ static void hook_pause_dtor(void *self) {
 /* InGamePlayScreen::applyInput(float): runs only while the gameplay screen is on top */
 static void hook_apply(void *self, float dt) {
     g_play_time = now_s();
+    if (self != g_apply_self) {
+        if (g_apply_self) nclog("gameplay screen changed - clearing captured game pointers");
+        g_apply_self = self;
+        g_cic = 0; g_ci = 0; g_dbg_logged = false;
+    }
     if (g_orig_apply) g_orig_apply(self, dt);
 }
 
