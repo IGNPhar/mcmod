@@ -15,16 +15,18 @@ extern "C" {
   X(fps_alpha,    F, 1.0,  0.1, 1) X(fps_bg, I, 1, 0, 1) X(fps_menus, I, 1, 0, 1) \
   X(armor_on,     I, 1,    0, 1) X(armor_x, F, 0.005, 0, 1) X(armor_y, F, 0.03, 0, 1) X(armor_size, I, 3, 1, 8) \
   X(armor_alpha,  F, 1.0,  0.1, 1) X(armor_bg, I, 0, 0, 1) X(armor_bar, I, 0, 0, 1) X(armor_num, I, 1, 0, 2) \
-  X(armor_horiz,  I, 0,    0, 1) \
+  X(armor_horiz,  I, 0,    0, 1) X(armor_col, I, 0xEBEBF5, 0, 0xFFFFFF) \
+  X(arrow_on,     I, 0,    0, 1) X(arrow_x, F, 0.50, 0, 1) X(arrow_y, F, 0.68, 0, 1) X(arrow_size, I, 3, 1, 8) \
+  X(arrow_alpha,  F, 1.0,  0.1, 1) X(arrow_col, I, 0xEBEBF5, 0, 0xFFFFFF) \
   X(elytra_on,    I, 1,    0, 1) X(elytra_x, F, 0.50, 0, 1) X(elytra_y, F, 0.56, 0, 1) X(elytra_size, I, 3, 1, 8) X(elytra_style, I, 0, 0, 2) \
-  X(elytra_alpha, F, 1.0,  0.1, 1) X(elytra_outline, I, 1, 0, 1) \
-  X(elytra_angle_on, I, 1, 0, 1) X(elytra_angle_x, F, 0.50, 0, 1) X(elytra_angle_y, F, 0.64, 0, 1) X(elytra_angle_size, I, 2, 1, 8) X(elytra_angle_alpha, F, 1.0, 0.1, 1) \
-  X(f3_on,         I, 0,    0, 1) X(f3_x, F, 0.90, 0, 1) X(f3_y, F, 0.68, 0, 1) X(f3_size, I, 3, 1, 8) X(f3_alpha, F, 0.9, 0.1, 1) \
+  X(elytra_alpha, F, 1.0,  0.1, 1) X(elytra_col, I, 0xAA8CFF, 0, 0xFFFFFF) \
   X(nohurt,       I, 0,    0, 1) \
   X(zoom_on,      I, 0,    0, 1) X(zoom_x, F, 0.90, 0, 1) X(zoom_y, F, 0.30, 0, 1) X(zoom_btn, I, 3, 1, 8) \
   X(zoom_alpha,   F, 0.85, 0.1, 1) X(zoom_level, F, 4.0, 1.5, 12) X(zoom_label, I, 0, 0, 7) \
+  X(zoom_col,     I, 0x38306E, 0, 0xFFFFFF) X(zoom_pause, I, 0, 0, 1) \
   X(persp_on,     I, 0,    0, 1) X(persp_x, F, 0.90, 0, 1) X(persp_y, F, 0.46, 0, 1) X(persp_btn, I, 3, 1, 8) \
   X(persp_alpha,  F, 0.85, 0.1, 1) X(persp_label, I, 0, 0, 7) \
+  X(persp_col,    I, 0x38306E, 0, 0xFFFFFF) X(persp_pause, I, 0, 0, 1) \
   X(perf_gfx,     I, 0,    0, 1) X(perf_light, I, 0, 0, 1) X(perf_skies, I, 0, 0, 1) X(perf_bob, I, 0, 0, 1) \
   X(perf_view_on, I, 0,    0, 1) X(perf_view, I, 6, 2, 16) \
   X(ui_font,      I, 0,    0, 6) \

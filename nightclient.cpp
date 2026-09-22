@@ -33,7 +33,7 @@ extern "C" {
 #include "nc_font.h"
 #include "nc_icons.h"
 
-#define NC_VERSION "0.2.1"
+#define NC_VERSION "0.3"
 #define NC_DIR "/sdcard/games/com.mojang/NightClient/"
 #define NC_CFG NC_DIR "config.txt"
 #define NC_LOG NC_DIR "log.txt"
@@ -43,7 +43,6 @@ extern "C" bool mih_isMovingForward(void *self) __asm__("_ZNK16MoveInputHandler1
 extern "C" bool mob_isSneaking(void *self)      __asm__("_ZNK3Mob10isSneakingEv");
 extern "C" bool mob_isSprinting(void *self)     __asm__("_ZNK3Mob11isSprintingEv");
 extern "C" bool mob_isGliding(void *self)       __asm__("_ZNK3Mob9isGlidingEv");
-extern "C" float mob_getPitch(void *self)         __asm__("_ZNK3Mob8getPitchEv");
 extern "C" bool player_isUsingItem(void *self)  __asm__("_ZNK6Player11isUsingItemEv");
 extern "C" void lp_setSprinting(void *self, bool on) __asm__("_ZN11LocalPlayer12setSprintingEb");
 extern "C" const void *mob_getArmor(void *self, int slot) __asm__("_ZNK3Mob8getArmorE9ArmorSlot");
@@ -53,6 +52,8 @@ extern "C" int  ii_getDamage(const void *it)    __asm__("_ZNK12ItemInstance14get
 extern "C" int  ii_getMaxDamage(const void *it) __asm__("_ZNK12ItemInstance12getMaxDamageEv");
 extern "C" void cic_toggle3rd(void *self, void *ci)
     __asm__("_ZN20ClientInputCallbacks38handleToggleThirdPersonViewButtonPressER14ClientInstance");
+extern "C" void *player_getSupplies(void *self) __asm__("_ZNK6Player11getSuppliesEv");
+extern "C" int   container_getItemCount(void *self, int id, int aux) __asm__("_ZN9Container12getItemCountEii");
 
 /* ---- Toolbox mod loader: hook registration (libmodloader.so) ---- */
 extern "C" void tml_registerHook(const char *symbol, void *hook, void **original)
@@ -66,14 +67,14 @@ static struct { int type; float x, y; } g_q[256];
 static int g_qn = 0;
 
 static void *volatile g_settings_this = 0;   /* the open SettingsScreenController, if any */
+static void *volatile g_pause_this = 0;      /* the open PauseScreenController, if any */
 static void *volatile g_cic = 0;             /* ClientInputCallbacks* (captured) */
 static void *volatile g_ci = 0;              /* ClientInstance* (captured) */
 static volatile double g_play_time = 0;      /* last time the gameplay screen was on top */
 static volatile double g_tick_time = 0;      /* last time the local player ticked */
 static volatile int    g_zoom_active = 0;
-static volatile int    g_f3_active = 0;
 static float           g_zoom_cur = 1.0f;
-static struct { volatile int gliding; volatile float pitch; int present[4], id[4], dur[4], max[4]; } g_snap;
+static struct { volatile int gliding; int present[4], id[4], dur[4], max[4]; int arrows; } g_snap;
 
 static bool  g_menu_open = false, g_edit = false;
 static int   g_sel = 0;
@@ -103,6 +104,14 @@ static ImVec2 V(float x, float y) { return ImVec2(x, y); }
 static ImVec2 vadd(ImVec2 a, ImVec2 b) { return ImVec2(a.x + b.x, a.y + b.y); }
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static ImU32 rgba(int r, int g, int b, float a) { return IM_COL32(r, g, b, (int)(clampf(a, 0, 1) * 255.0f)); }
+static ImU32 packed(int rgb, float a) { return rgba((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff, a); }
+static void color_picker(const char *label, int *rgb) {
+    float c[3] = { ((*rgb >> 16) & 0xff) / 255.0f, ((*rgb >> 8) & 0xff) / 255.0f, (*rgb & 0xff) / 255.0f };
+    if (ImGui::ColorEdit3(label, c, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel))
+        *rgb = ((int)(c[0] * 255.0f + 0.5f) << 16) | ((int)(c[1] * 255.0f + 0.5f) << 8) | (int)(c[2] * 255.0f + 0.5f);
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", label);
+}
 
 /* ------------------------------------------------------------------ game hooks */
 typedef void  (*fn_this)(void *);
@@ -132,6 +141,20 @@ static void hook_settings_dtor(void *self) {
     if (g_orig_dtor) g_orig_dtor(self);
 }
 
+/* PauseScreenController has no exported onOpen, so we mark it open on its first tick
+ * and closed on destruction - it ticks every frame while it is on screen. */
+typedef void (*fn_pausetick)(void *);
+static fn_pausetick g_orig_pausetick = 0;
+static fn_this g_orig_pausedtor = 0;
+static void hook_pause_tick(void *self) {
+    if (g_pause_this != self) { g_pause_this = self; nclog("pause screen opened"); }
+    if (g_orig_pausetick) g_orig_pausetick(self);
+}
+static void hook_pause_dtor(void *self) {
+    if (self == g_pause_this) { g_pause_this = 0; nclog("pause screen closed"); }
+    if (g_orig_pausedtor) g_orig_pausedtor(self);
+}
+
 /* InGamePlayScreen::applyInput(float): runs only while the gameplay screen is on top */
 static void hook_apply(void *self, float dt) {
     g_play_time = now_s();
@@ -143,9 +166,10 @@ static void hook_tick(void *self, void *player) {
     if (g_orig_tick) g_orig_tick(self, player);
     if (!player) return;
     g_tick_time = now_s();
-    if (g_cfg.elytra_on || g_cfg.elytra_angle_on || g_cfg.f3_on) {
-        g_snap.gliding = mob_isGliding(player) ? 1 : 0;
-        g_snap.pitch = mob_getPitch(player);
+    if (g_cfg.elytra_on) g_snap.gliding = mob_isGliding(player) ? 1 : 0;
+    if (g_cfg.arrow_on) {
+        void *supplies = player_getSupplies(player);
+        g_snap.arrows = supplies ? container_getItemCount(supplies, 262, 0) : 0;   /* 262 = arrow */
     }
     if (g_cfg.armor_on) {
         for (int i = 0; i < 4; i++) {
@@ -321,7 +345,7 @@ static int menu_font_mult(float h) {
 }
 
 /* ------------------------------------------------------------------ HUD elements */
-enum { E_FPS, E_ARMOR, E_ELYTRA, E_ELYTRA_ANGLE, E_F3, E_ZOOM, E_PERSP, E_N, E_COUNT };
+enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_ZOOM, E_PERSP, E_N, E_COUNT };
 
 static float fpx(int size) { return 8.0f * (float)size; }
 static ImVec2 txt(const char *s, int size) { return ImGui::GetFont()->CalcTextSizeA(fpx(size), FLT_MAX, 0.0f, s); }
@@ -414,7 +438,7 @@ static void draw_armor(ImDrawList *dl, ImVec2 p, bool preview) {
             char b[16];
             if (g_cfg.armor_num == 1) snprintf(b, sizeof b, "%d/%d", rows[i].dur, rows[i].max);
             else                      snprintf(b, sizeof b, "%d%%", (int)(frac * 100.0f + 0.5f));
-            put_text_sh(dl, V(q.x + icon + gap, q.y + (icon - fpx(s)) * 0.5f), s, rgba(235, 235, 245, a), b, !g_cfg.armor_bg);
+            put_text_sh(dl, V(q.x + icon + gap, q.y + (icon - fpx(s)) * 0.5f), s, packed(g_cfg.armor_col, a), b, !g_cfg.armor_bg);
         }
         if (g_cfg.armor_bar) {
             float by = q.y + icon + s;
@@ -428,7 +452,7 @@ static void draw_armor(ImDrawList *dl, ImVec2 p, bool preview) {
     }
 }
 
-/* ---- Elytra indicator (icon, text, or both) ---- */
+/* ---- Elytra indicator (outline icon, text, or both) ---- */
 static ImVec2 size_elytra() {
     int s = g_cfg.elytra_size; float pad = 2.0f * s, icon = 16.0f * icon_k(s);
     ImVec2 t = txt("ELYTRA", s);
@@ -439,82 +463,29 @@ static ImVec2 size_elytra() {
 static void draw_elytra(ImDrawList *dl, ImVec2 p) {
     int s = g_cfg.elytra_size; float a = g_cfg.elytra_alpha, pad = 2.0f * s, icon = 16.0f * icon_k(s);
     ImVec2 sz = size_elytra();
+    ImU32 col = packed(g_cfg.elytra_col, a);
     if (g_cfg.elytra_style != 0) box(dl, p, sz, a, s);
     float tx = p.x + pad;
     if (g_cfg.elytra_style != 1) {
-        draw_icon(dl, NC_ICON_ELYTRA, V(p.x + pad, p.y + (sz.y - icon) * 0.5f), icon, rgba(255, 255, 255, a));
+        draw_icon(dl, NC_ICON_ELYTRA_OUTLINE, V(p.x + pad, p.y + (sz.y - icon) * 0.5f), icon, col);
         tx += icon + 2.0f * s;
     }
-    if (g_cfg.elytra_style != 0) put_text(dl, V(tx, p.y + (sz.y - fpx(s)) * 0.5f), s, rgba(170, 140, 255, a), "ELYTRA");
+    if (g_cfg.elytra_style != 0) put_text(dl, V(tx, p.y + (sz.y - fpx(s)) * 0.5f), s, col, "ELYTRA");
 }
 
-/* Step 2: a clean outline version of the elytra indicator. This is drawn
- * as geometry so it remains visible with any resource pack. */
-static ImVec2 size_elytra_outline() {
-    float side = 20.0f * (float)icon_k(g_cfg.elytra_size);
-    float pad = 2.0f * g_cfg.elytra_size;
-    return V(side + 2.0f * pad, side + 2.0f * pad);
+/* ---- Arrow HUD: bow icon + total arrows in your inventory ---- */
+static ImVec2 size_arrow() {
+    int s = g_cfg.arrow_size; float pad = 2.0f * s, icon = 16.0f * icon_k(s);
+    ImVec2 t = txt("999", s);
+    return V(icon + 2.0f * s + t.x + 2 * pad, (icon > t.y ? icon : t.y) + 2 * pad);
 }
-static void draw_elytra_outline(ImDrawList *dl, ImVec2 p) {
-    int s = g_cfg.elytra_size;
-    float a = g_cfg.elytra_alpha;
-    ImVec2 sz = size_elytra_outline();
-    float pad = 2.0f * s;
-    ImVec2 c = V(p.x + sz.x * 0.5f, p.y + sz.y * 0.5f);
-    float wing = sz.x * 0.42f, top = sz.y * 0.18f, bottom = sz.y * 0.82f;
-    ImU32 col = rgba(235, 235, 245, a);
-    dl->AddLine(V(c.x, p.y + top), V(c.x - wing, p.y + bottom), col, (float)s);
-    dl->AddLine(V(c.x, p.y + top), V(c.x + wing, p.y + bottom), col, (float)s);
-    dl->AddLine(V(c.x - wing, p.y + bottom), V(c.x - wing * 0.55f, p.y + bottom - sz.y * 0.10f), col, (float)s);
-    dl->AddLine(V(c.x + wing, p.y + bottom), V(c.x + wing * 0.55f, p.y + bottom - sz.y * 0.10f), col, (float)s);
-    dl->AddLine(V(c.x, p.y + top), V(c.x, p.y + bottom), col, (float)s);
-}
-
-/* Step 2: gliding pitch/angle readout. */
-static ImVec2 size_elytra_angle() {
-    char b[32];
-    snprintf(b, sizeof b, "ELYTRA %d°", (int)g_snap.pitch);
-    ImVec2 t = txt(b, g_cfg.elytra_angle_size);
-    float pad = 2.0f * g_cfg.elytra_angle_size;
-    return V(t.x + 2.0f * pad, t.y + 2.0f * pad);
-}
-static void draw_elytra_angle(ImDrawList *dl, ImVec2 p) {
-    int sz = g_cfg.elytra_angle_size;
-    float a = g_cfg.elytra_angle_alpha;
-    char b[32];
-    snprintf(b, sizeof b, "ELYTRA %d°", (int)g_snap.pitch);
-    ImVec2 boxsz = size_elytra_angle();
-    box(dl, p, boxsz, a, sz);
-    put_text(dl, V(p.x + 2.0f * sz, p.y + 2.0f * sz), sz, rgba(235, 235, 245, a), b);
-}
-
-/* Step 2: F3-style diagnostics toggle. It intentionally shows only client-local
- * diagnostics; it does not alter gameplay or send anything to a server. */
-static ImVec2 size_f3() {
-    int sz = g_cfg.f3_size;
-    ImVec2 t = txt("F3", sz);
-    float pad = 2.0f * sz;
-    return V(t.x + 2.0f * pad, t.y + 2.0f * pad);
-}
-static void draw_f3_overlay(ImDrawList *dl, float fps) {
-    int sz = g_cfg.f3_size;
-    float a = g_cfg.f3_alpha;
-    char lines[4][64];
-    snprintf(lines[0], sizeof lines[0], "Night Client " NC_VERSION);
-    snprintf(lines[1], sizeof lines[1], "FPS: %d", (int)(fps + 0.5f));
-    snprintf(lines[2], sizeof lines[2], "Pitch: %d°", (int)g_snap.pitch);
-    snprintf(lines[3], sizeof lines[3], "Elytra: %s", g_snap.gliding ? "GLIDING" : "OFF");
-    float pad = 2.0f * sz;
-    float lineh = fpx(sz) + sz;
-    float maxw = 0;
-    for (int i = 0; i < 4; i++) {
-        ImVec2 t = txt(lines[i], sz);
-        if (t.x > maxw) maxw = t.x;
-    }
-    ImVec2 boxsz = V(maxw + 2 * pad, lineh * 4 + 2 * pad);
-    box(dl, V(pad, pad), boxsz, a, sz);
-    for (int i = 0; i < 4; i++)
-        put_text(dl, V(pad + pad, pad + pad + i * lineh), sz, rgba(235, 235, 245, a), lines[i]);
+static void draw_arrow(ImDrawList *dl, ImVec2 p, int count) {
+    int s = g_cfg.arrow_size; float a = g_cfg.arrow_alpha, pad = 2.0f * s, icon = 16.0f * icon_k(s);
+    ImVec2 sz = size_arrow();
+    box(dl, p, sz, a, s);
+    draw_icon(dl, NC_ICON_ARROW, V(p.x + pad, p.y + (sz.y - icon) * 0.5f), icon, rgba(255, 255, 255, a));
+    char b[8]; snprintf(b, sizeof b, "%d", count);
+    put_text(dl, V(p.x + pad + icon + 2.0f * s, p.y + (sz.y - fpx(s)) * 0.5f), s, packed(g_cfg.arrow_col, a), b);
 }
 
 /* ---- round/square buttons (N, Zoom, Perspective) with preset labels ---- */
@@ -529,8 +500,10 @@ static ImVec2 btn_size(const char *label, int level) {
     if (strlen(label) > 1) { float need = txt(label, label_level(side)).x + side * 0.6f; if (need > w) w = need; }
     return V(floorf(w), side);
 }
-static void draw_button(ImDrawList *dl, ImVec2 p, ImVec2 sz, const char *label, float alpha, bool round, bool active) {
-    ImU32 bg = active ? rgba(128, 107, 255, alpha) : rgba(56, 48, 122, alpha);
+static void draw_button(ImDrawList *dl, ImVec2 p, ImVec2 sz, const char *label, float alpha, bool round, bool active, int base_col) {
+    ImU32 bg = active ? rgba((int)clampf(((base_col >> 16) & 0xff) * 1.5f, 0, 255), (int)clampf(((base_col >> 8) & 0xff) * 1.5f, 0, 255),
+                             (int)clampf((base_col & 0xff) * 1.5f, 0, 255), alpha)
+                      : packed(base_col, alpha);
     ImVec2 c = V(p.x + sz.x * 0.5f, p.y + sz.y * 0.5f);
     if (round && strlen(label) == 1) dl->AddCircleFilled(c, sz.y * 0.5f, bg);
     else                             dl->AddRectFilled(p, V(p.x + sz.x, p.y + sz.y), bg, sz.y * 0.18f);
@@ -541,7 +514,7 @@ static void draw_button(ImDrawList *dl, ImVec2 p, ImVec2 sz, const char *label, 
 
 /* draws one button in its own click window; returns true when it was tapped */
 static bool button_at(const char *id, ImVec2 p, ImVec2 sz, const char *label, float alpha, bool round,
-                      bool active_look, NcRect *rect) {
+                      bool active_look, int base_col, NcRect *rect) {
     ImGui::SetNextWindowPos(p);
     ImGui::SetNextWindowSize(sz);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, V(0, 0));
@@ -552,7 +525,7 @@ static bool button_at(const char *id, ImVec2 p, ImVec2 sz, const char *label, fl
     ImGui::SetCursorScreenPos(p);
     bool pressed = ImGui::InvisibleButton("##b", sz);
     bool active = ImGui::IsItemActive();
-    draw_button(ImGui::GetWindowDrawList(), p, sz, label, alpha, round, active || active_look);
+    draw_button(ImGui::GetWindowDrawList(), p, sz, label, alpha, round, active || active_look, base_col);
     ImGui::End();
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
@@ -563,26 +536,22 @@ static bool button_at(const char *id, ImVec2 p, ImVec2 sz, const char *label, fl
 /* ---- per-element accessors used by "Move on screen" ---- */
 static int *elem_on(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_on; case E_ARMOR: return &g_cfg.armor_on; case E_ELYTRA: return &g_cfg.elytra_on;
-                 case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_on; case E_F3: return &g_cfg.f3_on;
-                 case E_ZOOM: return &g_cfg.zoom_on; case E_PERSP: return &g_cfg.persp_on; default: return 0; }
+                 case E_ARROW: return &g_cfg.arrow_on; case E_ZOOM: return &g_cfg.zoom_on; case E_PERSP: return &g_cfg.persp_on; default: return 0; }
 }
 static float *elem_x(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_x; case E_ARMOR: return &g_cfg.armor_x; case E_ELYTRA: return &g_cfg.elytra_x;
-                 case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_x; case E_F3: return &g_cfg.f3_x;
-                 case E_ZOOM: return &g_cfg.zoom_x; case E_PERSP: return &g_cfg.persp_x; default: return &g_cfg.n_x; }
+                 case E_ARROW: return &g_cfg.arrow_x; case E_ZOOM: return &g_cfg.zoom_x; case E_PERSP: return &g_cfg.persp_x; default: return &g_cfg.n_x; }
 }
 static float *elem_y(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_y; case E_ARMOR: return &g_cfg.armor_y; case E_ELYTRA: return &g_cfg.elytra_y;
-                 case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_y; case E_F3: return &g_cfg.f3_y;
-                 case E_ZOOM: return &g_cfg.zoom_y; case E_PERSP: return &g_cfg.persp_y; default: return &g_cfg.n_y; }
+                 case E_ARROW: return &g_cfg.arrow_y; case E_ZOOM: return &g_cfg.zoom_y; case E_PERSP: return &g_cfg.persp_y; default: return &g_cfg.n_y; }
 }
 static ImVec2 elem_size(int e) {
     switch (e) {
         case E_FPS: return size_fps();
         case E_ARMOR: return size_armor();
-        case E_ELYTRA: return g_cfg.elytra_outline ? size_elytra_outline() : size_elytra();
-        case E_ELYTRA_ANGLE: return size_elytra_angle();
-        case E_F3: return btn_size("F3", g_cfg.f3_size);
+        case E_ELYTRA: return size_elytra();
+        case E_ARROW: return size_arrow();
         case E_ZOOM:  return btn_size(pick(LBL_ZOOM,  NC_COUNT_OF(LBL_ZOOM),  g_cfg.zoom_label),  g_cfg.zoom_btn);
         case E_PERSP: return btn_size(pick(LBL_PERSP, NC_COUNT_OF(LBL_PERSP), g_cfg.persp_label), g_cfg.persp_btn);
         default:      return btn_size(pick(LBL_N,     NC_COUNT_OF(LBL_N),     g_cfg.n_label),     g_cfg.n_btn);
@@ -602,7 +571,7 @@ static void build_edit(float w, float h) {
     ImDrawList *dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(V(0, 0), V(w, h), IM_COL32(0, 0, 0, 120));
 
-    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "elytra_angle", "f3", "zoom", "persp", "n" };
+    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "arrow", "zoom", "persp", "n" };
 
     for (int e = 0; e < E_COUNT; e++) {
         int *on = elem_on(e);
@@ -611,12 +580,11 @@ static void build_edit(float w, float h) {
         switch (e) {
             case E_FPS:    draw_fps(dl, pos, 60.0f); break;
             case E_ARMOR:  draw_armor(dl, pos, true); break;
-            case E_ELYTRA: if (g_cfg.elytra_outline) draw_elytra_outline(dl, pos); else draw_elytra(dl, pos); break;
-            case E_ELYTRA_ANGLE: draw_elytra_angle(dl, pos); break;
-            case E_F3: draw_button(dl, pos, sz, "F3", 1.0f, false, false); break;
-            case E_ZOOM:   draw_button(dl, pos, sz, pick(LBL_ZOOM,  NC_COUNT_OF(LBL_ZOOM),  g_cfg.zoom_label),  1.0f, false, false); break;
-            case E_PERSP:  draw_button(dl, pos, sz, pick(LBL_PERSP, NC_COUNT_OF(LBL_PERSP), g_cfg.persp_label), 1.0f, false, false); break;
-            default:       draw_button(dl, pos, sz, pick(LBL_N,     NC_COUNT_OF(LBL_N),     g_cfg.n_label),     1.0f, true,  false); break;
+            case E_ELYTRA: draw_elytra(dl, pos); break;
+            case E_ARROW:  draw_arrow(dl, pos, 42); break;
+            case E_ZOOM:   draw_button(dl, pos, sz, pick(LBL_ZOOM,  NC_COUNT_OF(LBL_ZOOM),  g_cfg.zoom_label),  1.0f, false, false, g_cfg.zoom_col); break;
+            case E_PERSP:  draw_button(dl, pos, sz, pick(LBL_PERSP, NC_COUNT_OF(LBL_PERSP), g_cfg.persp_label), 1.0f, false, false, g_cfg.persp_col); break;
+            default:       draw_button(dl, pos, sz, pick(LBL_N,     NC_COUNT_OF(LBL_N),     g_cfg.n_label),     1.0f, true,  false, 0x38306E); break;
         }
         dl->AddRect(pos, vadd(pos, sz), IM_COL32(150, 130, 255, 255), 3.0f, 0, 2.0f);
         ImGui::SetCursorScreenPos(pos);
@@ -688,6 +656,7 @@ static void panel_armor() {
     chk("Bar", &g_cfg.armor_bar);
     chk("Dark background", &g_cfg.armor_bg);
     chk("Lay out sideways", &g_cfg.armor_horiz);
+    color_picker("Text color", &g_cfg.armor_col);
     if (ImGui::RadioButton("No text", g_cfg.armor_num == 0)) g_cfg.armor_num = 0;
     ImGui::SameLine();
     if (ImGui::RadioButton("Durability", g_cfg.armor_num == 1)) g_cfg.armor_num = 1;
@@ -697,22 +666,21 @@ static void panel_armor() {
     hud_pos(&g_cfg.armor_x, &g_cfg.armor_y);
 }
 static void panel_elytra() {
-    head("Elytra indicator", &g_cfg.elytra_on, "Shows an indicator while you are gliding.");
-    chk("Outline instead of icon", &g_cfg.elytra_outline);
-    if (!g_cfg.elytra_outline) {
-        if (ImGui::RadioButton("Icon", g_cfg.elytra_style == 0)) g_cfg.elytra_style = 0;
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Text", g_cfg.elytra_style == 1)) g_cfg.elytra_style = 1;
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Both", g_cfg.elytra_style == 2)) g_cfg.elytra_style = 2;
-    }
+    head("Elytra indicator", &g_cfg.elytra_on, "An outline elytra icon on screen while you are gliding.");
+    if (ImGui::RadioButton("Icon", g_cfg.elytra_style == 0)) g_cfg.elytra_style = 0;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Text", g_cfg.elytra_style == 1)) g_cfg.elytra_style = 1;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Both", g_cfg.elytra_style == 2)) g_cfg.elytra_style = 2;
+    color_picker("Color", &g_cfg.elytra_col);
     hud_look(&g_cfg.elytra_size, &g_cfg.elytra_alpha);
     hud_pos(&g_cfg.elytra_x, &g_cfg.elytra_y);
-    ImGui::Separator();
-    ImGui::TextColored(ACCENT, "Elytra angle");
-    chk("Show angle", &g_cfg.elytra_angle_on);
-    hud_look(&g_cfg.elytra_angle_size, &g_cfg.elytra_angle_alpha);
-    hud_pos(&g_cfg.elytra_angle_x, &g_cfg.elytra_angle_y);
+}
+static void panel_arrow() {
+    head("Arrow HUD", &g_cfg.arrow_on, "A bow icon and the total arrows in your inventory. Only shows in a world.");
+    color_picker("Number color", &g_cfg.arrow_col);
+    hud_look(&g_cfg.arrow_size, &g_cfg.arrow_alpha);
+    hud_pos(&g_cfg.arrow_x, &g_cfg.arrow_y);
 }
 static void panel_nohurt() {
     head("No hurt cam", &g_cfg.nohurt, "Stops the screen from tilting when you take damage.");
@@ -721,6 +689,8 @@ static void panel_zoom() {
     head("Zoom", &g_cfg.zoom_on, "A Z button in the world. Tap it to zoom in, tap again to zoom out.");
     sl_f("Zoom level", &g_cfg.zoom_level, 1.5f, 12.0f);
     label_btn(LBL_ZOOM, NC_COUNT_OF(LBL_ZOOM), &g_cfg.zoom_label);
+    color_picker("Button color", &g_cfg.zoom_col);
+    chk("Also show on the pause screen", &g_cfg.zoom_pause);
     sl_i("Button size", &g_cfg.zoom_btn, 1, 8);
     sl_f("Button opacity", &g_cfg.zoom_alpha, 0.1f, 1.0f);
     hud_pos(&g_cfg.zoom_x, &g_cfg.zoom_y);
@@ -728,17 +698,12 @@ static void panel_zoom() {
 static void panel_persp() {
     head("Perspective button", &g_cfg.persp_on, "A button in the world that switches first/third person.");
     label_btn(LBL_PERSP, NC_COUNT_OF(LBL_PERSP), &g_cfg.persp_label);
+    color_picker("Button color", &g_cfg.persp_col);
+    chk("Also show on the pause screen", &g_cfg.persp_pause);
     sl_i("Button size", &g_cfg.persp_btn, 1, 8);
     sl_f("Button opacity", &g_cfg.persp_alpha, 0.1f, 1.0f);
     hud_pos(&g_cfg.persp_x, &g_cfg.persp_y);
     ImGui::TextDisabled("Works after you have touched the screen in a world once.");
-}
-static void panel_f3() {
-    head("F3 button", &g_cfg.f3_on, "A small on-screen F3-style diagnostics button.");
-    sl_i("Button size", &g_cfg.f3_size, 1, 8);
-    sl_f("Button opacity", &g_cfg.f3_alpha, 0.1f, 1.0f);
-    hud_pos(&g_cfg.f3_x, &g_cfg.f3_y);
-    ImGui::TextDisabled("Tap F3 in a world to show local client diagnostics.");
 }
 static void panel_perf() {
     head("FPS optimizer", 0, "Lower some graphics settings for more FPS. Each one is separate.");
@@ -756,6 +721,7 @@ static void panel_client() {
     label_btn(LBL_N, NC_COUNT_OF(LBL_N), &g_cfg.n_label);
     sl_i("N button size", &g_cfg.n_btn, 1, 8);
     sl_f("N button opacity", &g_cfg.n_alpha, 0.2f, 1.0f);
+    ImGui::TextDisabled("The N button shows on the Settings screen and the pause menu.");
     move_btn();
     ImGui::TextDisabled("N button position");
     sl_f("N X", &g_cfg.n_x, 0.0f, 1.0f);
@@ -772,7 +738,7 @@ static const Mod g_mods[] = {
     { "FPS counter",        &g_cfg.fps_on,     panel_fps },
     { "Armor HUD",          &g_cfg.armor_on,   panel_armor },
     { "Elytra indicator",   &g_cfg.elytra_on,  panel_elytra },
-    { "F3 button",           &g_cfg.f3_on,       panel_f3 },
+    { "Arrow HUD",          &g_cfg.arrow_on,   panel_arrow },
     { "No hurt cam",        &g_cfg.nohurt,     panel_nohurt },
     { "Zoom",               &g_cfg.zoom_on,    panel_zoom },
     { "Perspective button", &g_cfg.persp_on,   panel_persp },
@@ -786,7 +752,7 @@ static void build_menu(float w, float h, NcRect *win_rect) {
     ImGui::SetNextWindowSize(V(w * 0.84f, h * 0.88f), ImGuiCond_Always);
     ImGui::Begin("##night_menu", NULL, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                                        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
-                                       ImGuiWindowFlags_NoScrollbar);
+                                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
     win_rect->visible = 1; win_rect->x = p.x; win_rect->y = p.y; win_rect->w = s.x; win_rect->h = s.y;
 
@@ -849,32 +815,27 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     float fps = nc_fps_frame(&g_fps, now);
 
     bool in_settings = (g_settings_this != 0) || g_cfg.n_always;
+    bool in_pause    = (g_pause_this != 0);
+    bool menu_reach  = in_settings || in_pause;                 /* N button appears in either */
     bool in_world = (now - g_tick_time) < 0.6;
     bool play_hud = (now - g_play_time) < 0.3;
-    if (!in_settings) { g_menu_open = false; g_edit = false; }
+    if (!menu_reach) { g_menu_open = false; g_edit = false; }
 
     bool any_armor = g_snap.present[0] || g_snap.present[1] || g_snap.present[2] || g_snap.present[3];
     bool fps_vis    = g_cfg.fps_on && (g_cfg.fps_menus || in_world);
     bool armor_vis  = g_cfg.armor_on && in_world && any_armor && !g_menu_open && !g_edit;
     bool elytra_vis = g_cfg.elytra_on && in_world && g_snap.gliding && !g_menu_open && !g_edit;
-    bool elytra_angle_vis = g_cfg.elytra_angle_on && in_world && g_snap.gliding && !g_menu_open && !g_edit;
-    bool hud_btns   = play_hud && !in_settings && !g_menu_open && !g_edit;
-    /* The N button is the Night Client entry point; it must not depend on the
-     * settings-screen hook being active. Keeping it visible also keeps ImGui
-     * alive when no other optional HUD module is enabled. */
-    bool n_vis      = !g_menu_open && !g_edit;
-    bool f3_vis     = g_cfg.f3_on && hud_btns;
-    bool zoom_vis   = g_cfg.zoom_on && hud_btns;
-    bool persp_vis  = g_cfg.persp_on && hud_btns;
+    bool arrow_vis  = g_cfg.arrow_on && in_world && g_snap.arrows > 0 && !g_menu_open && !g_edit;
+    bool hud_btns   = play_hud && !in_settings && !g_menu_open && !g_edit;         /* the world itself */
+    bool zoom_vis   = g_cfg.zoom_on && (hud_btns || (in_pause && g_cfg.zoom_pause && !g_menu_open && !g_edit));
+    bool persp_vis  = g_cfg.persp_on && (hud_btns || (in_pause && g_cfg.persp_pause && !g_menu_open && !g_edit));
     if (!zoom_vis) g_zoom_active = 0;
-    if (!f3_vis && !g_cfg.f3_on) g_f3_active = 0;
 
-    bool need = n_vis || fps_vis || armor_vis || elytra_vis || elytra_angle_vis || f3_vis || g_f3_active ||
-                zoom_vis || persp_vis || in_settings || g_menu_open || g_edit;
+    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || zoom_vis || persp_vis || menu_reach || g_menu_open || g_edit;
     if (g_frames % 900 == 0 && g_beats < 6) {
         g_beats++;
-        nclog("heartbeat: frames=%d settings=%d world=%d play=%d menu=%d fps=%.0f", g_frames, g_settings_this != 0,
-              (int)in_world, (int)play_hud, (int)g_menu_open, fps);
+        nclog("heartbeat: frames=%d settings=%d pause=%d world=%d play=%d menu=%d fps=%.0f", g_frames, g_settings_this != 0,
+              g_pause_this != 0, (int)in_world, (int)play_hud, (int)g_menu_open, fps);
     }
     if (need && !g_drawing_logged) { g_drawing_logged = true; nclog("drawing started"); }
 
@@ -937,39 +898,25 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     } else {
         if (fps_vis)    draw_fps(fg, place(g_cfg.fps_x, g_cfg.fps_y, size_fps()), fps);
         if (armor_vis)  draw_armor(fg, place(g_cfg.armor_x, g_cfg.armor_y, size_armor()), false);
-        if (elytra_vis) {
-            ImVec2 ep = place(g_cfg.elytra_x, g_cfg.elytra_y,
-                              g_cfg.elytra_outline ? size_elytra_outline() : size_elytra());
-            if (g_cfg.elytra_outline) draw_elytra_outline(fg, ep);
-            else draw_elytra(fg, ep);
-        }
-        if (elytra_angle_vis)
-            draw_elytra_angle(fg, place(g_cfg.elytra_angle_x, g_cfg.elytra_angle_y, size_elytra_angle()));
-
-        if (f3_vis) {
-            ImVec2 fsz = btn_size("F3", g_cfg.f3_size);
-            if (button_at("##night_f3", place(g_cfg.f3_x, g_cfg.f3_y, fsz), fsz, "F3",
-                          g_cfg.f3_alpha, false, g_f3_active != 0, &hud[2]))
-                g_f3_active = g_f3_active ? 0 : 1;
-        }
-        if (g_f3_active && hud_btns) draw_f3_overlay(fg, fps);
+        if (elytra_vis) draw_elytra(fg, place(g_cfg.elytra_x, g_cfg.elytra_y, size_elytra()));
+        if (arrow_vis)  draw_arrow(fg, place(g_cfg.arrow_x, g_cfg.arrow_y, size_arrow()), g_snap.arrows);
 
         if (zoom_vis) {
             ImVec2 sz = elem_size(E_ZOOM);
             if (button_at("##night_zoom", place(g_cfg.zoom_x, g_cfg.zoom_y, sz), sz, pick(LBL_ZOOM, NC_COUNT_OF(LBL_ZOOM), g_cfg.zoom_label),
-                          g_cfg.zoom_alpha, false, g_zoom_active != 0, &hud[0]))
+                          g_cfg.zoom_alpha, false, g_zoom_active != 0, g_cfg.zoom_col, &hud[0]))
                 g_zoom_active = g_zoom_active ? 0 : 1;
         }
         if (persp_vis) {
             ImVec2 sz = elem_size(E_PERSP);
             if (button_at("##night_persp", place(g_cfg.persp_x, g_cfg.persp_y, sz), sz, pick(LBL_PERSP, NC_COUNT_OF(LBL_PERSP), g_cfg.persp_label),
-                          g_cfg.persp_alpha, false, false, &hud[1]))
+                          g_cfg.persp_alpha, false, false, g_cfg.persp_col, &hud[1]))
                 do_perspective();
         }
-        if (n_vis) {
+        if (menu_reach && !g_menu_open) {
             ImVec2 sz = elem_size(E_N);
             if (button_at("##night_n", place(g_cfg.n_x, g_cfg.n_y, sz), sz, pick(LBL_N, NC_COUNT_OF(LBL_N), g_cfg.n_label),
-                          g_cfg.n_alpha, true, false, &nrect)) {
+                          g_cfg.n_alpha, true, false, 0x38306E, &nrect)) {
                 g_menu_open = true; nclog("menu opened");
             }
         }
@@ -1050,6 +997,8 @@ static void nc_init(void) {
     reg("settings open", "_ZN24SettingsScreenController6onOpenEv", (void *)hook_settings_open, (void **)&g_orig_onOpen);
     reg("settings close", "_ZN24SettingsScreenControllerD1Ev", (void *)hook_settings_dtor, (void **)&g_orig_dtor);
     reg("gameplay screen", "_ZN16InGamePlayScreen10applyInputEf", (void *)hook_apply, (void **)&g_orig_apply);
+    reg("pause tick", "_ZN21PauseScreenController4tickEv", (void *)hook_pause_tick, (void **)&g_orig_pausetick);
+    reg("pause close", "_ZN21PauseScreenControllerD1Ev", (void *)hook_pause_dtor, (void **)&g_orig_pausedtor);
 
     /* per mod: can be switched off in config.txt (hook_x=0) if one of them ever crashes the game */
     if (g_cfg.hook_hurt)  reg("no hurt cam", "_ZN19LevelRendererPlayer7bobHurtER6Matrixf", (void *)hook_bobhurt, (void **)&g_orig_bob);
