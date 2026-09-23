@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
+#include <jni.h>
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -110,6 +111,182 @@ static int   g_log_lines = 0, g_frames = 0, g_beats = 0, g_touch_logged = 0;
 static bool  g_dbg_logged = false;
 static bool  g_drawing_logged = false, g_gl_err_logged = false;
 static GLuint g_icon_tex[NC_ICON_COUNT];
+static JavaVM *g_jvm = 0;
+static jobject g_kb_activity = 0;
+static jobject g_kb_edit = 0;
+static bool g_kb_open = false;
+static int g_kb_target = 0; /* 1 zoom, 2 perspective, 3 drop, 4 N */
+static char *g_kb_text = 0;
+
+typedef jint (*fn_JNI_GetCreatedJavaVMs)(JavaVM **, jsize, jsize *);
+
+static bool kb_get_vm() {
+    if (g_jvm) return true;
+    void *art = dlopen("libart.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!art) art = dlopen("libart.so", RTLD_NOW);
+    if (!art) return false;
+    fn_JNI_GetCreatedJavaVMs getv = (fn_JNI_GetCreatedJavaVMs)dlsym(art, "JNI_GetCreatedJavaVMs");
+    if (!getv) return false;
+    jsize n = 0;
+    if (getv(&g_jvm, 1, &n) != JNI_OK || n <= 0 || !g_jvm) { g_jvm = 0; return false; }
+    return true;
+}
+
+static JNIEnv *kb_env(bool *attached) {
+    *attached = false;
+    if (!kb_get_vm()) return 0;
+    JNIEnv *env = 0;
+    jint r = g_jvm->GetEnv((void **)&env, JNI_VERSION_1_6);
+    if (r == JNI_EDETACHED) {
+        if (g_jvm->AttachCurrentThread(&env, 0) != JNI_OK) return 0;
+        *attached = true;
+    }
+    return env;
+}
+
+static void kb_release(JNIEnv *env, bool attached) { if (attached && g_jvm) g_jvm->DetachCurrentThread(); (void)env; }
+
+/* Finds the current Activity through ActivityThread. This is deliberately best-effort:
+ * if the old MCPE build exposes no Java VM/activity, the text field still works as an
+ * ImGui field but no soft keyboard is requested. */
+static jobject kb_find_activity(JNIEnv *env) {
+    jclass at = env->FindClass("android/app/ActivityThread");
+    if (!at) return 0;
+    jmethodID cur = env->GetStaticMethodID(at, "currentActivityThread", "()Landroid/app/ActivityThread;");
+    if (!cur) { env->DeleteLocalRef(at); return 0; }
+    jobject thread = env->CallStaticObjectMethod(at, cur);
+    if (!thread) { env->DeleteLocalRef(at); return 0; }
+    jfieldID af = env->GetFieldID(at, "mActivities", "Landroid/util/ArrayMap;");
+    if (!af) { env->DeleteLocalRef(thread); env->DeleteLocalRef(at); return 0; }
+    jobject map = env->GetObjectField(thread, af);
+    env->DeleteLocalRef(thread); env->DeleteLocalRef(at);
+    if (!map) return 0;
+    jclass mc = env->FindClass("android/util/ArrayMap");
+    if (!mc) { env->DeleteLocalRef(map); return 0; }
+    jmethodID vals = env->GetMethodID(mc, "values", "()Ljava/util/Collection;");
+    env->DeleteLocalRef(mc);
+    if (!vals) { env->DeleteLocalRef(map); return 0; }
+    jobject col = env->CallObjectMethod(map, vals);
+    env->DeleteLocalRef(map);
+    if (!col) return 0;
+    jclass cc = env->FindClass("java/util/Collection");
+    jmethodID itid = cc ? env->GetMethodID(cc, "iterator", "()Ljava/util/Iterator;") : 0;
+    if (!itid) { if (cc) env->DeleteLocalRef(cc); env->DeleteLocalRef(col); return 0; }
+    jobject it = env->CallObjectMethod(col, itid);
+    env->DeleteLocalRef(cc);
+    env->DeleteLocalRef(col);
+    if (!it) return 0;
+    jclass ic = env->FindClass("java/util/Iterator");
+    jmethodID has = ic ? env->GetMethodID(ic, "hasNext", "()Z") : 0;
+    jmethodID next = ic ? env->GetMethodID(ic, "next", "()Ljava/lang/Object;") : 0;
+    if (!has || !next) { if (ic) env->DeleteLocalRef(ic); env->DeleteLocalRef(it); return 0; }
+    jobject activity = 0;
+    while (env->CallBooleanMethod(it, has)) {
+        jobject rec = env->CallObjectMethod(it, next);
+        if (!rec) continue;
+        jclass rc = env->GetObjectClass(rec);
+        jfieldID actf = env->GetFieldID(rc, "activity", "Landroid/app/Activity;");
+        if (actf) { activity = env->GetObjectField(rec, actf); env->DeleteLocalRef(rc); env->DeleteLocalRef(rec); break; }
+        env->DeleteLocalRef(rc); env->DeleteLocalRef(rec);
+    }
+    env->DeleteLocalRef(ic); env->DeleteLocalRef(it);
+    return activity;
+}
+
+static bool kb_show(JNIEnv *env) {
+    if (!g_kb_edit) return false;
+    jclass editc = env->FindClass("android/widget/EditText");
+    jclass viewc = env->FindClass("android/view/View");
+    jclass immc = env->FindClass("android/view/inputmethod/InputMethodManager");
+    if (!editc || !viewc || !immc) return false;
+    jmethodID request = env->GetMethodID(viewc, "requestFocus", "()Z");
+    jmethodID ctx = env->GetMethodID(viewc, "getContext", "()Landroid/content/Context;");
+    jmethodID getsvc = env->GetMethodID(env->FindClass("android/content/Context"), "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+    jfieldID svcfield = env->GetStaticFieldID(env->FindClass("android/content/Context"), "INPUT_METHOD_SERVICE", "Ljava/lang/String;");
+    if (!request || !ctx || !getsvc || !svcfield) return false;
+    env->CallBooleanMethod(g_kb_edit, request);
+    jobject context = env->CallObjectMethod(g_kb_edit, ctx);
+    jstring svcname = (jstring)env->GetStaticObjectField(env->FindClass("android/content/Context"), svcfield);
+    jobject imm = env->CallObjectMethod(context, getsvc, svcname);
+    jmethodID show = env->GetMethodID(immc, "showSoftInput", "(Landroid/view/View;I)Z");
+    jboolean ok = show && imm ? env->CallBooleanMethod(imm, show, g_kb_edit, 0) : JNI_FALSE;
+    if (imm) env->DeleteLocalRef(imm); if (context) env->DeleteLocalRef(context); if (svcname) env->DeleteLocalRef(svcname);
+    return ok == JNI_TRUE;
+}
+
+static bool kb_start(int target, char *text) {
+    bool attached = false; JNIEnv *env = kb_env(&attached); if (!env) return false;
+    if (!g_kb_activity) g_kb_activity = kb_find_activity(env);
+    if (!g_kb_activity) { kb_release(env, attached); return false; }
+    jclass ec = env->FindClass("android/widget/EditText");
+    if (!ec) { kb_release(env, attached); return false; }
+    jmethodID ctor = env->GetMethodID(ec, "<init>", "(Landroid/content/Context;)V");
+    if (!ctor) { kb_release(env, attached); return false; }
+    g_kb_edit = env->NewGlobalRef(env->NewObject(ec, ctor, g_kb_activity));
+    if (!g_kb_edit) { kb_release(env, attached); return false; }
+    jmethodID setText = env->GetMethodID(ec, "setText", "(Ljava/lang/CharSequence;)V");
+    jmethodID setAlpha = env->GetMethodID(ec, "setAlpha", "(F)V");
+    jmethodID setInput = env->GetMethodID(ec, "setInputType", "(I)V");
+    jstring js = env->NewStringUTF(text ? text : "");
+    if (setText) env->CallVoidMethod(g_kb_edit, setText, js);
+    if (setAlpha) env->CallVoidMethod(g_kb_edit, setAlpha, 0.0f);
+    if (setInput) env->CallVoidMethod(g_kb_edit, setInput, 1); /* TYPE_CLASS_TEXT */
+    if (js) env->DeleteLocalRef(js);
+    /* addContentView is normally expected on the UI thread; old MCPE often renders on the
+     * main thread, so try it directly and fall back gracefully if Android rejects it. */
+    jclass ac = env->GetObjectClass(g_kb_activity);
+    jmethodID add = env->GetMethodID(ac, "addContentView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V");
+    jclass lpc = env->FindClass("android/view/ViewGroup$LayoutParams");
+    jmethodID lpctor = lpc ? env->GetMethodID(lpc, "<init>", "(II)V") : 0;
+    jobject lp = lpctor ? env->NewObject(lpc, lpctor, 1, 1) : 0;
+    if (!add || !lp) { kb_release(env, attached); return false; }
+    env->CallVoidMethod(g_kb_activity, add, g_kb_edit, lp);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); kb_release(env, attached); return false; }
+    g_kb_target = target; g_kb_text = text; g_kb_open = kb_show(env);
+    kb_release(env, attached);
+    return g_kb_open;
+}
+
+static void kb_poll() {
+    if (!g_kb_open || !g_kb_edit || !g_kb_text) return;
+    bool attached = false; JNIEnv *env = kb_env(&attached); if (!env) return;
+    jclass ec = env->FindClass("android/widget/EditText");
+    jmethodID get = ec ? env->GetMethodID(ec, "getText", "()Landroid/text/Editable;") : 0;
+    jobject ed = get ? env->CallObjectMethod(g_kb_edit, get) : 0;
+    if (ed) {
+        jclass oc = env->FindClass("java/lang/Object");
+        jmethodID ts = oc ? env->GetMethodID(oc, "toString", "()Ljava/lang/String;") : 0;
+        jstring js = ts ? (jstring)env->CallObjectMethod(ed, ts) : 0;
+        if (js) { const char *u = env->GetStringUTFChars(js, 0); if (u) { strncpy(g_kb_text, u, 16); g_kb_text[16] = 0; env->ReleaseStringUTFChars(js, u); } env->DeleteLocalRef(js); }
+        env->DeleteLocalRef(ed);
+    }
+    kb_release(env, attached);
+}
+
+static void kb_stop() {
+    if (!g_kb_open) return;
+    bool attached = false; JNIEnv *env = kb_env(&attached); if (!env) return;
+    jclass viewc = env->FindClass("android/view/View");
+    jclass immc = env->FindClass("android/view/inputmethod/InputMethodManager");
+    if (viewc && immc && g_kb_edit) {
+        jmethodID ctx = env->GetMethodID(viewc, "getContext", "()Landroid/content/Context;");
+        jobject context = ctx ? env->CallObjectMethod(g_kb_edit, ctx) : 0;
+        jclass cc = env->FindClass("android/content/Context");
+        jmethodID getsvc = cc ? env->GetMethodID(cc, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;") : 0;
+        jfieldID sf = cc ? env->GetStaticFieldID(cc, "INPUT_METHOD_SERVICE", "Ljava/lang/String;") : 0;
+        jstring name = (sf && cc) ? (jstring)env->GetStaticObjectField(cc, sf) : 0;
+        jobject imm = (getsvc && context) ? env->CallObjectMethod(context, getsvc, name) : 0;
+        jmethodID hide = imm ? env->GetMethodID(immc, "hideSoftInputFromWindow", "(Landroid/os/IBinder;I)Z") : 0;
+        jmethodID token = viewc ? env->GetMethodID(viewc, "getWindowToken", "()Landroid/os/IBinder;") : 0;
+        jobject tok = token ? env->CallObjectMethod(g_kb_edit, token) : 0;
+        if (hide && tok) env->CallBooleanMethod(imm, hide, tok, 0);
+        if (tok) env->DeleteLocalRef(tok); if (imm) env->DeleteLocalRef(imm); if (name) env->DeleteLocalRef(name); if (context) env->DeleteLocalRef(context);
+    }
+    if (g_kb_edit) { env->DeleteGlobalRef(g_kb_edit); g_kb_edit = 0; }
+    g_kb_open = false; g_kb_target = 0; g_kb_text = 0;
+    kb_release(env, attached);
+}
+
 
 /* ------------------------------------------------------------------ helpers */
 static void nclog(const char *fmt, ...) {
@@ -805,8 +982,11 @@ static bool draw_icon(ImDrawList *dl, int idx, ImVec2 p, float side, ImU32 tint)
     dl->AddImage((ImTextureID)(uintptr_t)g_icon_tex[idx], p, V(p.x + side, p.y + side), V(0, 0), V(1, 1), tint);
     return true;
 }
+static void box_col(ImDrawList *dl, ImVec2 p, ImVec2 s, float alpha, float size, int rgb) {
+    dl->AddRectFilled(p, vadd(p, s), packed(rgb, alpha), 2.0f * size);
+}
 static void box(ImDrawList *dl, ImVec2 p, ImVec2 s, float alpha, float size) {
-    dl->AddRectFilled(p, vadd(p, s), rgba(8, 8, 14, 0.75f * alpha), 2.0f * size);
+    box_col(dl, p, s, 0.75f * alpha, size, 0x08080E);
 }
 static float btn_side(float level) { return floorf(g_h * 0.035f * (float)level); }
 static ImVec2 place(float fx, float fy, ImVec2 sz) { return V(floorf(fx * (g_w - sz.x)), floorf(fy * (g_h - sz.y))); }
@@ -820,8 +1000,8 @@ static ImVec2 size_fps() {
 static void draw_fps(ImDrawList *dl, ImVec2 p, float fps) {
     char b[24]; snprintf(b, sizeof b, "FPS: %d", (int)(fps + 0.5f));
     ImVec2 s = size_fps(); float pad = 2.0f * g_cfg.fps_size;
-    if (g_cfg.fps_bg) box(dl, p, s, g_cfg.fps_bg_alpha, (int)g_cfg.fps_size);
-    put_text(dl, V(p.x + pad, p.y + pad), g_cfg.fps_size, rgba(235, 235, 245, g_cfg.fps_alpha), b);
+    if (g_cfg.fps_bg) box_col(dl, p, s, g_cfg.fps_bg_alpha, g_cfg.fps_size, g_cfg.fps_bg_col);
+    put_text(dl, V(p.x + pad, p.y + pad), g_cfg.fps_size, packed(g_cfg.fps_col, g_cfg.fps_alpha), b);
 }
 
 /* ---- Armor HUD ---- */
@@ -863,7 +1043,7 @@ static void draw_armor(ImDrawList *dl, ImVec2 p, bool preview) {
     ImVec2 rs, total; armor_metrics(&rs, &total);
     float s = g_cfg.armor_size; float a = g_cfg.armor_alpha, pad = 2.0f * s, gap = 2.0f * s, icon = 16.0f * icon_k(s);
     static const char *letters[4] = { "H", "C", "L", "B" };
-    if (g_cfg.armor_bg) box(dl, p, total, g_cfg.armor_bg_alpha, (int)s);
+    if (g_cfg.armor_bg) box_col(dl, p, total, g_cfg.armor_bg_alpha, s, g_cfg.armor_bg_col);
     int shown = 0;
     for (int i = 0; i < 4; i++) {
         if (!rows[i].present) continue;
@@ -907,7 +1087,7 @@ static void draw_elytra(ImDrawList *dl, ImVec2 p) {
     float s = g_cfg.elytra_size; float a = g_cfg.elytra_alpha, pad = 2.0f * s, icon = 16.0f * icon_k(s);
     ImVec2 sz = size_elytra();
     ImU32 col = packed(g_cfg.elytra_col, a);
-    if (g_cfg.elytra_style != 0) box(dl, p, sz, g_cfg.elytra_bg_alpha, (int)s);
+    if (g_cfg.elytra_style != 0) box_col(dl, p, sz, g_cfg.elytra_bg_alpha, s, g_cfg.elytra_bg_col);
     float tx = p.x + pad;
     if (g_cfg.elytra_style != 1) {
         draw_icon(dl, NC_ICON_ELYTRA_OUTLINE, V(p.x + pad, p.y + (sz.y - icon) * 0.5f), icon, rgba((g_cfg.elytra_col >> 16) & 0xff, (g_cfg.elytra_col >> 8) & 0xff, g_cfg.elytra_col & 0xff, a));
@@ -925,7 +1105,7 @@ static ImVec2 size_arrow() {
 static void draw_arrow(ImDrawList *dl, ImVec2 p, int count) {
     float s = g_cfg.arrow_size; float a = g_cfg.arrow_alpha, pad = 2.0f * s, icon = 16.0f * icon_k(s);
     ImVec2 sz = size_arrow();
-    if (g_cfg.arrow_bg) box(dl, p, sz, g_cfg.arrow_bg_alpha, (int)s);
+    if (g_cfg.arrow_bg) box_col(dl, p, sz, g_cfg.arrow_bg_alpha, s, g_cfg.arrow_bg_col);
     draw_icon(dl, NC_ICON_ARROW, V(p.x + pad, p.y + (sz.y - icon) * 0.5f), icon, rgba(255, 255, 255, a));
     char b[8];
     if (count < 0) snprintf(b, sizeof b, "-");
@@ -943,7 +1123,7 @@ static ImVec2 size_elytra_angle() {
 static void draw_elytra_angle(ImDrawList *dl, ImVec2 p) {
     float s = g_cfg.elytra_angle_size; float a = g_cfg.elytra_angle_alpha, pad = 2.0f * s;
     ImVec2 sz = size_elytra_angle();
-    if (g_cfg.elytra_angle_bg) box(dl, p, sz, g_cfg.elytra_angle_bg_alpha, (int)s);
+    if (g_cfg.elytra_angle_bg) box_col(dl, p, sz, g_cfg.elytra_angle_bg_alpha, s, g_cfg.elytra_angle_bg_col);
     char b[32]; snprintf(b, sizeof b, "Angle: %.1f deg", g_snap.elytra_angle);
     put_text_sh(dl, V(p.x + pad, p.y + pad), s, packed(g_cfg.elytra_angle_col, a), b, !g_cfg.elytra_angle_bg);
 }
@@ -957,7 +1137,7 @@ static ImVec2 size_speed() {
 static void draw_speed(ImDrawList *dl, ImVec2 p, float bps) {
     float z = g_cfg.speed_size; float a = g_cfg.speed_alpha, pad = 2.0f * z;
     ImVec2 sz = size_speed();
-    if (g_cfg.speed_bg) box(dl, p, sz, g_cfg.speed_bg_alpha, (int)z);
+    if (g_cfg.speed_bg) box_col(dl, p, sz, g_cfg.speed_bg_alpha, z, g_cfg.speed_bg_col);
     char b[32]; snprintf(b, sizeof b, "Speed: %.2f B/s", bps);
     put_text_sh(dl, V(p.x + pad, p.y + pad), z, packed(g_cfg.speed_col, a), b, !g_cfg.speed_bg);
 }
@@ -984,21 +1164,21 @@ static ImVec2 btn_size(const char *label, float level) {
     if (strlen(label) > 1) { float need = txt(label, label_level(side)).x + side * 0.6f; if (need > w) w = need; }
     return V(floorf(w), side);
 }
-static void draw_button(ImDrawList *dl, ImVec2 p, ImVec2 sz, const char *label, float bg_alpha, float text_alpha, bool round, bool active, int base_col) {
-    ImU32 bg = active ? rgba((int)clampf(((base_col >> 16) & 0xff) * 1.5f, 0, 255), (int)clampf(((base_col >> 8) & 0xff) * 1.5f, 0, 255),
-                             (int)clampf((base_col & 0xff) * 1.5f, 0, 255), bg_alpha)
-                      : packed(base_col, bg_alpha);
+static void draw_button(ImDrawList *dl, ImVec2 p, ImVec2 sz, const char *label, float bg_alpha, float text_alpha, bool round, bool active, int bg_col, int text_col) {
+    ImU32 bg = active ? rgba((int)clampf(((bg_col >> 16) & 0xff) * 1.5f, 0, 255), (int)clampf(((bg_col >> 8) & 0xff) * 1.5f, 0, 255),
+                             (int)clampf((bg_col & 0xff) * 1.5f, 0, 255), bg_alpha)
+                      : packed(bg_col, bg_alpha);
     ImVec2 c = V(p.x + sz.x * 0.5f, p.y + sz.y * 0.5f);
     if (round && strlen(label) == 1) dl->AddCircleFilled(c, sz.y * 0.5f, bg);
     else                             dl->AddRectFilled(p, V(p.x + sz.x, p.y + sz.y), bg, sz.y * 0.18f);
     int lv = label_level(sz.y);
     ImVec2 t = txt(label, lv);
-    put_text(dl, V(c.x - t.x * 0.5f, c.y - t.y * 0.5f), lv, rgba(240, 240, 250, text_alpha), label);
+    put_text(dl, V(c.x - t.x * 0.5f, c.y - t.y * 0.5f), lv, packed(text_col, text_alpha), label);
 }
 
 /* draws one button in its own click window; returns true when it was tapped */
 static bool button_at(const char *id, ImVec2 p, ImVec2 sz, const char *label, float bg_alpha, float text_alpha, bool round,
-                      bool active_look, int base_col, NcRect *rect) {
+                      bool active_look, int base_col, int text_col, NcRect *rect) {
     ImGui::SetNextWindowPos(p);
     ImGui::SetNextWindowSize(sz);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, V(0, 0));
@@ -1009,7 +1189,7 @@ static bool button_at(const char *id, ImVec2 p, ImVec2 sz, const char *label, fl
     ImGui::SetCursorScreenPos(p);
     bool pressed = ImGui::InvisibleButton("##b", sz);
     bool active = ImGui::IsItemActive();
-    draw_button(ImGui::GetWindowDrawList(), p, sz, label, bg_alpha, text_alpha, round, active || active_look, base_col);
+    draw_button(ImGui::GetWindowDrawList(), p, sz, label, bg_alpha, text_alpha, round, active || active_look, base_col, text_col);
     ImGui::End();
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
@@ -1074,10 +1254,10 @@ static void build_edit(float w, float h) {
             case E_ARROW:  draw_arrow(dl, pos, g_snap.arrow_count < 0 ? -1 : g_snap.arrow_count); break;
             case E_SPEED:  draw_speed(dl, pos, 4.20f); break;
             case E_ELYTRA_ANGLE: draw_elytra_angle(dl, pos); break;
-            case E_DROP:   draw_button(dl, pos, sz, g_cfg.drop_text,  1.0f, g_cfg.drop_text_alpha, false, false, g_cfg.drop_col); break;
-            case E_ZOOM:   draw_button(dl, pos, sz, g_cfg.zoom_text,  1.0f, g_cfg.zoom_text_alpha, false, false, g_cfg.zoom_col); break;
-            case E_PERSP:  draw_button(dl, pos, sz, g_cfg.persp_text, 1.0f, g_cfg.persp_text_alpha, false, false, g_cfg.persp_col); break;
-            default:       draw_button(dl, pos, sz, g_cfg.n_text,     1.0f, g_cfg.n_text_alpha, true,  false, 0x38306E); break;
+            case E_DROP:   draw_button(dl, pos, sz, g_cfg.drop_text,  g_cfg.drop_alpha, g_cfg.drop_text_alpha, false, false, g_cfg.drop_bg_col, g_cfg.drop_col); break;
+            case E_ZOOM:   draw_button(dl, pos, sz, g_cfg.zoom_text,  g_cfg.zoom_alpha, g_cfg.zoom_text_alpha, false, false, g_cfg.zoom_bg_col, g_cfg.zoom_col); break;
+            case E_PERSP:  draw_button(dl, pos, sz, g_cfg.persp_text, g_cfg.persp_alpha, g_cfg.persp_text_alpha, false, false, g_cfg.persp_bg_col, g_cfg.persp_col); break;
+            default:       draw_button(dl, pos, sz, g_cfg.n_text,     g_cfg.n_alpha, g_cfg.n_text_alpha, true,  false, g_cfg.n_bg_col, g_cfg.n_col); break;
         }
         dl->AddRect(pos, vadd(pos, sz), IM_COL32(150, 130, 255, 255), 3.0f, 0, 2.0f);
         ImGui::SetCursorScreenPos(pos);
@@ -1095,7 +1275,7 @@ static void build_edit(float w, float h) {
     put_text(dl, V((w - ht.x) * 0.5f, h * 0.06f), 3, IM_COL32(235, 235, 245, 255), hint);
     float bw = fpx(3) * 5.0f, bh = fpx(3) * 2.4f;
     ImGui::SetCursorScreenPos(V((w - bw) * 0.5f, h * 0.06f + fpx(3) * 1.8f));
-    if (ImGui::Button("Done", V(bw, bh))) { g_edit = false; g_menu_open = true; nclog("layout saved"); }
+    if (ImGui::Button("Done", V(bw, bh))) { g_edit = false; g_menu_open = true; kb_stop(); nclog("layout saved"); }
     ImGui::End();
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
@@ -1123,9 +1303,18 @@ static void button_text_edit(const char *label, char *text) {
     char id[48];
     snprintf(id, sizeof id, "%s##btntext", label);
     ImGui::InputText(id, text, 17, ImGuiInputTextFlags_CharsNoBlank);
+    if (ImGui::IsItemActivated()) {
+        int target = 0;
+        if (!strcmp(label, "Button text")) {
+            if (text == g_cfg.zoom_text) target = 1;
+            else if (text == g_cfg.persp_text) target = 2;
+            else if (text == g_cfg.drop_text) target = 3;
+        } else if (!strcmp(label, "N button text")) target = 4;
+        if (target && !g_kb_open) kb_start(target, text);
+    }
 }
 static void hud_look(float *size, float *alpha, float *bg_alpha) {
-    sl_f("Size", size, 1.0f, 8.0f);
+    sl_f("Size", size, 0.5f, 12.0f);
     sl_f("Text / icon opacity", alpha, 0.05f, 1.0f);
     sl_f("Background opacity", bg_alpha, 0.0f, 1.0f);
 }
@@ -1143,6 +1332,8 @@ static void panel_fps() {
     head("FPS counter", &g_cfg.fps_on, "Shows your frame rate.");
     chk("Also show in menus (outside a world)", &g_cfg.fps_menus);
     chk("Dark background", &g_cfg.fps_bg);
+    color_picker("Text color", &g_cfg.fps_col);
+    color_picker("Background color", &g_cfg.fps_bg_col);
     hud_look(&g_cfg.fps_size, &g_cfg.fps_alpha, &g_cfg.fps_bg_alpha);
     hud_pos(&g_cfg.fps_x, &g_cfg.fps_y);
 }
@@ -1157,6 +1348,7 @@ static void panel_armor() {
     if (ImGui::RadioButton("Durability", g_cfg.armor_num == 1)) g_cfg.armor_num = 1;
     ImGui::SameLine();
     if (ImGui::RadioButton("Percent", g_cfg.armor_num == 2)) g_cfg.armor_num = 2;
+    color_picker("Background color", &g_cfg.armor_bg_col);
     hud_look(&g_cfg.armor_size, &g_cfg.armor_alpha, &g_cfg.armor_bg_alpha);
     hud_pos(&g_cfg.armor_x, &g_cfg.armor_y);
 }
@@ -1167,7 +1359,8 @@ static void panel_elytra() {
     if (ImGui::RadioButton("Text", g_cfg.elytra_style == 1)) g_cfg.elytra_style = 1;
     ImGui::SameLine();
     if (ImGui::RadioButton("Both", g_cfg.elytra_style == 2)) g_cfg.elytra_style = 2;
-    color_picker("Color", &g_cfg.elytra_col);
+    color_picker("Text / icon color", &g_cfg.elytra_col);
+    color_picker("Background color", &g_cfg.elytra_bg_col);
     hud_look(&g_cfg.elytra_size, &g_cfg.elytra_alpha, &g_cfg.elytra_bg_alpha);
     hud_pos(&g_cfg.elytra_x, &g_cfg.elytra_y);
 }
@@ -1175,6 +1368,7 @@ static void panel_arrow() {
     head("Arrow HUD", &g_cfg.arrow_on, "Shows while you hold a bow, with the total arrows in your inventory.");
     chk("Dark background", &g_cfg.arrow_bg);
     color_picker("Number color", &g_cfg.arrow_col);
+    color_picker("Background color", &g_cfg.arrow_bg_col);
     hud_look(&g_cfg.arrow_size, &g_cfg.arrow_alpha, &g_cfg.arrow_bg_alpha);
     hud_pos(&g_cfg.arrow_x, &g_cfg.arrow_y);
 }
@@ -1182,6 +1376,7 @@ static void panel_speed() {
     head("Speed indicator", &g_cfg.speed_on, "Shows your real horizontal movement speed in blocks per second.");
     chk("Dark background", &g_cfg.speed_bg);
     color_picker("Text color", &g_cfg.speed_col);
+    color_picker("Background color", &g_cfg.speed_bg_col);
     hud_look(&g_cfg.speed_size, &g_cfg.speed_alpha, &g_cfg.speed_bg_alpha);
     hud_pos(&g_cfg.speed_x, &g_cfg.speed_y);
 }
@@ -1189,6 +1384,7 @@ static void panel_elytra_angle() {
     head("Elytra angle", &g_cfg.elytra_angle_on, "Shows your actual flight pitch while gliding.");
     chk("Dark background", &g_cfg.elytra_angle_bg);
     color_picker("Text color", &g_cfg.elytra_angle_col);
+    color_picker("Background color", &g_cfg.elytra_angle_bg_col);
     hud_look(&g_cfg.elytra_angle_size, &g_cfg.elytra_angle_alpha, &g_cfg.elytra_angle_bg_alpha);
     hud_pos(&g_cfg.elytra_angle_x, &g_cfg.elytra_angle_y);
 }
@@ -1199,9 +1395,10 @@ static void panel_zoom() {
     head("Zoom", &g_cfg.zoom_on, "A Z button in the world. Tap it to zoom in, tap again to zoom out.");
     sl_f("Zoom level", &g_cfg.zoom_level, 1.5f, 12.0f);
     button_text_edit("Button text", g_cfg.zoom_text);
-    color_picker("Button color", &g_cfg.zoom_col);
+    color_picker("Text color", &g_cfg.zoom_col);
+    color_picker("Background color", &g_cfg.zoom_bg_col);
     chk("Also show on the pause screen", &g_cfg.zoom_pause);
-    sl_f("Button size", &g_cfg.zoom_btn, 1.0f, 8.0f);
+    sl_f("Button size", &g_cfg.zoom_btn, 0.5f, 12.0f);
     sl_f("Background opacity", &g_cfg.zoom_alpha, 0.0f, 1.0f);
     sl_f("Text opacity", &g_cfg.zoom_text_alpha, 0.0f, 1.0f);
     hud_pos(&g_cfg.zoom_x, &g_cfg.zoom_y);
@@ -1209,9 +1406,10 @@ static void panel_zoom() {
 static void panel_persp() {
     head("Perspective button", &g_cfg.persp_on, "A button in the world that switches first/third person.");
     button_text_edit("Button text", g_cfg.persp_text);
-    color_picker("Button color", &g_cfg.persp_col);
+    color_picker("Text color", &g_cfg.persp_col);
+    color_picker("Background color", &g_cfg.persp_bg_col);
     chk("Also show on the pause screen", &g_cfg.persp_pause);
-    sl_f("Button size", &g_cfg.persp_btn, 1.0f, 8.0f);
+    sl_f("Button size", &g_cfg.persp_btn, 0.5f, 12.0f);
     sl_f("Background opacity", &g_cfg.persp_alpha, 0.0f, 1.0f);
     sl_f("Text opacity", &g_cfg.persp_text_alpha, 0.0f, 1.0f);
     hud_pos(&g_cfg.persp_x, &g_cfg.persp_y);
@@ -1237,9 +1435,10 @@ static void panel_perf() {
 static void panel_drop() {
     head("Quick drop", &g_cfg.drop_on, "A button that drops the item you're holding, one tap.");
     button_text_edit("Button text", g_cfg.drop_text);
-    color_picker("Button color", &g_cfg.drop_col);
+    color_picker("Text color", &g_cfg.drop_col);
+    color_picker("Background color", &g_cfg.drop_bg_col);
     chk("Also show on the pause screen", &g_cfg.drop_pause);
-    sl_f("Button size", &g_cfg.drop_btn, 1.0f, 8.0f);
+    sl_f("Button size", &g_cfg.drop_btn, 0.5f, 12.0f);
     sl_f("Background opacity", &g_cfg.drop_alpha, 0.0f, 1.0f);
     sl_f("Text opacity", &g_cfg.drop_text_alpha, 0.0f, 1.0f);
     hud_pos(&g_cfg.drop_x, &g_cfg.drop_y);
@@ -1249,7 +1448,9 @@ static void panel_client() {
     head("Client", 0, "Menu and N button.");
     sl_i("Menu text size (0 = auto)", &g_cfg.ui_font, 0, 6);
     button_text_edit("N button text", g_cfg.n_text);
-    sl_f("N button size", &g_cfg.n_btn, 1.0f, 8.0f);
+    color_picker("Text color", &g_cfg.n_col);
+    color_picker("Background color", &g_cfg.n_bg_col);
+    sl_f("N button size", &g_cfg.n_btn, 0.5f, 12.0f);
     sl_f("Background opacity", &g_cfg.n_alpha, 0.0f, 1.0f);
     sl_f("Text opacity", &g_cfg.n_text_alpha, 0.0f, 1.0f);
     ImGui::TextDisabled("The N button shows on the Settings screen and the pause menu.");
@@ -1336,6 +1537,7 @@ static void do_perspective() {
 
 static void nc_frame(EGLDisplay d, EGLSurface s) {
     if (g_imgui_failed) return;
+    kb_poll();
 
     EGLint w = 0, h = 0;
     eglQuerySurface(d, s, EGL_WIDTH, &w);
@@ -1354,7 +1556,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool menu_reach  = in_settings || in_pause;                 /* N button appears in either */
     bool in_world = (now - g_tick_time) < 0.6;
     bool play_hud = (now - g_play_time) < 0.3;
-    if (!menu_reach) { g_menu_open = false; g_edit = false; }
+    if (!menu_reach) { g_menu_open = false; g_edit = false; kb_stop(); }
 
     bool any_armor = g_snap.present[0] || g_snap.present[1] || g_snap.present[2] || g_snap.present[3];
     bool fps_vis    = g_cfg.fps_on && (g_cfg.fps_menus || in_world);
@@ -1444,25 +1646,25 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
         if (zoom_vis) {
             ImVec2 sz = elem_size(E_ZOOM);
             if (button_at("##night_zoom", place(g_cfg.zoom_x, g_cfg.zoom_y, sz), sz, g_cfg.zoom_text,
-                          g_cfg.zoom_alpha, g_cfg.zoom_text_alpha, false, g_zoom_active != 0, g_cfg.zoom_col, &hud[0]))
+                          g_cfg.zoom_alpha, g_cfg.zoom_text_alpha, false, g_zoom_active != 0, g_cfg.zoom_bg_col, g_cfg.zoom_col, &hud[0]))
                 g_zoom_active = g_zoom_active ? 0 : 1;
         }
         if (persp_vis) {
             ImVec2 sz = elem_size(E_PERSP);
             if (button_at("##night_persp", place(g_cfg.persp_x, g_cfg.persp_y, sz), sz, g_cfg.persp_text,
-                          g_cfg.persp_alpha, g_cfg.persp_text_alpha, false, false, g_cfg.persp_col, &hud[1]))
+                          g_cfg.persp_alpha, g_cfg.persp_text_alpha, false, false, g_cfg.persp_bg_col, g_cfg.persp_col, &hud[1]))
                 do_perspective();
         }
         if (drop_vis) {
             ImVec2 sz = elem_size(E_DROP);
             if (button_at("##night_drop", place(g_cfg.drop_x, g_cfg.drop_y, sz), sz, g_cfg.drop_text,
-                          g_cfg.drop_alpha, g_cfg.drop_text_alpha, false, false, g_cfg.drop_col, &hud[2]))
+                          g_cfg.drop_alpha, g_cfg.drop_text_alpha, false, false, g_cfg.drop_bg_col, g_cfg.drop_col, &hud[2]))
                 { if (g_cic && g_ci) cic_drop(g_cic, g_ci); else nclog("drop: game objects not captured yet"); }
         }
         if (menu_reach && !g_menu_open) {
             ImVec2 sz = elem_size(E_N);
             if (button_at("##night_n", place(g_cfg.n_x, g_cfg.n_y, sz), sz, g_cfg.n_text,
-                          g_cfg.n_alpha, g_cfg.n_text_alpha, true, false, 0x38306E, &nrect)) {
+                          g_cfg.n_alpha, g_cfg.n_text_alpha, true, false, g_cfg.n_bg_col, g_cfg.n_col, &nrect)) {
                 g_menu_open = true; nclog("menu opened");
             }
         }
