@@ -141,6 +141,7 @@ typedef int   (*fn_ptr)(void *, void *, void *, int);
 typedef bool  (*fn_getb)(void *);
 typedef int   (*fn_geti)(void *);
 typedef void  (*fn_entity_debug)(void *, void *);
+typedef void  (*fn_entity_render)(void *, void *, const void *, float, float);
 static fn_this  g_orig_onOpen = 0, g_orig_dtor = 0;
 static fn_tick  g_orig_tick = 0;
 static fn_apply g_orig_apply = 0;
@@ -150,6 +151,7 @@ static fn_ptr   g_orig_ptr = 0;
 static fn_getb  g_orig_fancy = 0, g_orig_skies = 0, g_orig_light = 0, g_orig_bobview = 0, g_orig_hitbox = 0;
 static fn_geti  g_orig_view = 0;
 static fn_entity_debug g_orig_entity_debug = 0;
+static fn_entity_render g_orig_entity_render = 0;
 
 static int snapshot_arrow_count(void *player) {
     /*
@@ -294,6 +296,17 @@ static bool hook_hitbox(void *s)  { if (g_cfg.hitbox_on)   return true;  return 
 static void hook_entity_debug(void *dispatcher, void *entity) {
     if (!g_cfg.hitbox_on) return;
     if (g_orig_entity_debug) g_orig_entity_debug(dispatcher, entity);
+}
+
+/* MCPE 1.1.5 does not call EntityRenderDispatcher::renderDebug() merely because
+ * the debug-box option getter returns true.  Its normal entity render path
+ * prepares the dispatcher/renderer state first.  Run the game's real debug
+ * renderer immediately after each entity finishes its normal render, while
+ * that exact dispatcher/entity pair is still active. */
+static void hook_entity_render(void *dispatcher, void *entity, const void *pos, float yaw, float dt) {
+    if (g_orig_entity_render) g_orig_entity_render(dispatcher, entity, pos, yaw, dt);
+    if (g_cfg.hitbox_on && dispatcher && entity && g_orig_entity_debug)
+        g_orig_entity_debug(dispatcher, entity);
 }
 
 static int  hook_view(void *s) {
@@ -1177,8 +1190,12 @@ static void nc_init(void) {
         "_ZN20ClientInputCallbacks21handlePointerLocationER14ClientInstanceRK24PointerLocationEventData11FocusImpact",
         (void *)hook_ptr, (void **)&g_orig_ptr);
     if (g_cfg.hook_hitbox) {
+        /* Keep the option hook harmless, but do not rely on it to trigger the
+         * debug pass.  We explicitly invoke the verified 1.1.5 dispatcher
+         * debug method from the verified entity render path below. */
         reg("hitboxes option", "_ZNK7Options25getDevRenderBoundingBoxesEv", (void *)hook_hitbox, (void **)&g_orig_hitbox);
         reg("entity hitbox renderer", "_ZN22EntityRenderDispatcher11renderDebugER6Entity", (void *)hook_entity_debug, (void **)&g_orig_entity_debug);
+        reg("entity render", "_ZN22EntityRenderDispatcher6renderER6EntityRK4Vec3ff", (void *)hook_entity_render, (void **)&g_orig_entity_render);
     }
     if (g_cfg.hook_perf) {
         reg("fast graphics", "_ZNK7Options16getFancyGraphicsEv", (void *)hook_fancy, (void **)&g_orig_fancy);
