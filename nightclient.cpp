@@ -18,6 +18,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <dlfcn.h>
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -56,6 +57,13 @@ extern "C" void cic_drop(void *self, void *ci)
     __asm__("_ZN20ClientInputCallbacks21handleDropButtonPressER14ClientInstance");
 extern "C" const void *player_getSelectedItem(void *self) __asm__("_ZNK6Player15getSelectedItemEv");
 extern "C" const float *entity_getPos(void *self) __asm__("_ZNK6Entity6getPosEv");
+
+struct NcVec2 { float x, y; };
+struct NcVec3 { float x, y, z; };
+extern "C" void entity_getInterpolatedPosition(NcVec3 *out, void *self, float a)
+    __asm__("_ZNK6Entity23getInterpolatedPositionEf");
+extern "C" void entity_getInterpolatedRotation(NcVec2 *out, void *self, float a)
+    __asm__("_ZNK6Entity23getInterpolatedRotationEf");
 /*
  * Arrow inventory access is intentionally not called yet.
  *
@@ -65,7 +73,6 @@ extern "C" const float *entity_getPos(void *self) __asm__("_ZNK6Entity6getPosEv"
  * Keep the HUD itself alive while we use a verified inventory path.
  */
 
-struct NcVec2 { float x, y; };
 extern "C" void entity_getRotation(NcVec2 *out, void *self) __asm__("_ZNK6Entity11getRotationEv");
 
 /* ---- Toolbox mod loader: hook registration (libmodloader.so) ---- */
@@ -140,7 +147,6 @@ typedef float (*fn_fov)(void *, float, bool);
 typedef int   (*fn_ptr)(void *, void *, void *, int);
 typedef bool  (*fn_getb)(void *);
 typedef int   (*fn_geti)(void *);
-typedef void  (*fn_entity_debug)(void *, void *);
 typedef void  (*fn_entity_render)(void *, void *, const void *, float, float);
 static fn_this  g_orig_onOpen = 0, g_orig_dtor = 0;
 static fn_tick  g_orig_tick = 0;
@@ -148,10 +154,26 @@ static fn_apply g_orig_apply = 0;
 static fn_bob   g_orig_bob = 0;
 static fn_fov   g_orig_fov = 0;
 static fn_ptr   g_orig_ptr = 0;
-static fn_getb  g_orig_fancy = 0, g_orig_skies = 0, g_orig_light = 0, g_orig_bobview = 0, g_orig_hitbox = 0;
+static fn_getb  g_orig_fancy = 0, g_orig_skies = 0, g_orig_light = 0, g_orig_bobview = 0;
 static fn_geti  g_orig_view = 0;
-static fn_entity_debug g_orig_entity_debug = 0;
 static fn_entity_render g_orig_entity_render = 0;
+
+/* Exact 1.1.5 Entity::bb layout: Entity + 0x104 contains
+ * six floats in AABB order: minX,minY,minZ,maxX,maxY,maxZ.
+ * We discovered this from Entity::setSize() and AABB::set(). */
+struct NcAabb6 { float minx, miny, minz, maxx, maxy, maxz; };
+
+/* MatrixStack globals are exported data symbols in the 1.1.5 lib.
+ * They are MatrixStack* variables; dlsym() gives us their storage address. */
+typedef void *(*fn_matrix_get_top)(void *);
+static void **g_projection_slot = 0;
+static void **g_view_slot = 0;
+static fn_matrix_get_top g_matrix_get_top = 0;
+static GLuint g_hit_prog = 0, g_hit_vbo = 0;
+static GLint g_hit_mvp = -1, g_hit_col = -1;
+static bool g_hit_gl_ready = false;
+static bool g_hit_symbols_ready = false;
+static bool g_hit_logged_symbols = false;
 
 static int snapshot_arrow_count(void *player) {
     /*
@@ -283,32 +305,358 @@ static int hook_ptr(void *self, void *ci, void *data, int focus) {
     return g_orig_ptr ? g_orig_ptr(self, ci, data, focus) : 0;
 }
 
+
+/* ------------------------------------------------------------------ researched 1.1.5 hitbox renderer
+ *
+ * The native EntityRenderDispatcher::renderDebug(Entity&) symbol is NOT the
+ * Java-style hitbox drawer in this exact 1.1.5 build.  It only dispatches to
+ * each entity renderer's debug virtual.  MobRenderer::renderDebug() is mostly
+ * navigation/debug information, not the desired AABB renderer.
+ *
+ * Instead we hook the REAL entity render call.  Its Vec3 parameter is already
+ * the interpolated entity position relative to the game's camera/player offset.
+ * The game's Entity AABB lives at Entity + 0x104.  We transform that AABB through
+ * the game's own Projection and View MatrixStack tops, so there is no guessed
+ * FOV/camera math.  Drawing happens immediately after the entity renderer and
+ * while the world depth buffer is still active, so blocks can occlude it.
+ */
+static void *hit_dlsym(const char *name) {
+    void *p = dlsym(RTLD_DEFAULT, name);
+    return p;
+}
+
+static bool hit_resolve_symbols() {
+    if (g_hit_symbols_ready) return true;
+    g_projection_slot = (void **)hit_dlsym("_ZN11MatrixStack10ProjectionE");
+    g_view_slot       = (void **)hit_dlsym("_ZN11MatrixStack4ViewE");
+    g_matrix_get_top  = (fn_matrix_get_top)hit_dlsym("_ZN11MatrixStack6getTopEv");
+    if (!g_projection_slot || !g_view_slot || !g_matrix_get_top) {
+        if (!g_hit_logged_symbols) {
+            g_hit_logged_symbols = true;
+            nclog("hitboxes: MatrixStack symbols unavailable p=%p v=%p top=%p",
+                  g_projection_slot, g_view_slot, (void *)g_matrix_get_top);
+        }
+        return false;
+    }
+    g_hit_symbols_ready = true;
+    if (!g_hit_logged_symbols) {
+        g_hit_logged_symbols = true;
+        nclog("hitboxes: MatrixStack symbols resolved");
+    }
+    return true;
+}
+
+static GLuint hit_compile_shader(GLenum type, const char *src) {
+    GLuint sh = glCreateShader(type);
+    if (!sh) return 0;
+    glShaderSource(sh, 1, &src, 0);
+    glCompileShader(sh);
+    GLint ok = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        glDeleteShader(sh);
+        return 0;
+    }
+    return sh;
+}
+
+static bool hit_init_gl() {
+    if (g_hit_gl_ready) return true;
+    const char *vs =
+        "attribute vec3 aPos;"
+        "uniform mat4 uMVP;"
+        "void main(){ gl_Position = uMVP * vec4(aPos,1.0); }";
+    const char *fs =
+        "precision mediump float;"
+        "uniform vec4 uColor;"
+        "void main(){ gl_FragColor = uColor; }";
+
+    GLuint v = hit_compile_shader(GL_VERTEX_SHADER, vs);
+    GLuint f = hit_compile_shader(GL_FRAGMENT_SHADER, fs);
+    if (!v || !f) {
+        if (v) glDeleteShader(v);
+        if (f) glDeleteShader(f);
+        nclog("hitboxes: shader compile failed");
+        return false;
+    }
+
+    GLuint p = glCreateProgram();
+    if (!p) {
+        glDeleteShader(v); glDeleteShader(f);
+        return false;
+    }
+    glAttachShader(p, v);
+    glAttachShader(p, f);
+    glBindAttribLocation(p, 0, "aPos");
+    glLinkProgram(p);
+    glDeleteShader(v);
+    glDeleteShader(f);
+
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        glDeleteProgram(p);
+        nclog("hitboxes: program link failed");
+        return false;
+    }
+
+    g_hit_prog = p;
+    g_hit_mvp = glGetUniformLocation(p, "uMVP");
+    g_hit_col = glGetUniformLocation(p, "uColor");
+    glGenBuffers(1, &g_hit_vbo);
+    if (!g_hit_vbo || g_hit_mvp < 0 || g_hit_col < 0) {
+        if (g_hit_vbo) glDeleteBuffers(1, &g_hit_vbo);
+        glDeleteProgram(g_hit_prog);
+        g_hit_prog = 0;
+        return false;
+    }
+
+    g_hit_gl_ready = true;
+    nclog("hitboxes: GL renderer initialized");
+    return true;
+}
+
+static void hit_copy_matrix(void *stack, float out[16]) {
+    const void *top = g_matrix_get_top ? g_matrix_get_top(stack) : 0;
+    if (!top) {
+        memset(out, 0, sizeof(float) * 16);
+        return;
+    }
+    memcpy(out, top, sizeof(float) * 16);
+}
+
+static void hit_identity(float *m) {
+    memset(m, 0, sizeof(float) * 16);
+    m[0] = m[5] = m[10] = m[15] = 1.0f;
+}
+
+static void hit_mul(float *out, const float *a, const float *b) {
+    float r[16];
+    /* Column-major matrix multiplication, matching OpenGL/Matrix::ptr(). */
+    for (int c = 0; c < 4; ++c) {
+        for (int rr = 0; rr < 4; ++rr) {
+            r[c * 4 + rr] =
+                a[0 * 4 + rr] * b[c * 4 + 0] +
+                a[1 * 4 + rr] * b[c * 4 + 1] +
+                a[2 * 4 + rr] * b[c * 4 + 2] +
+                a[3 * 4 + rr] * b[c * 4 + 3];
+        }
+    }
+    memcpy(out, r, sizeof(r));
+}
+
+static void hit_translate(float *m, float x, float y, float z) {
+    hit_identity(m);
+    m[12] = x;
+    m[13] = y;
+    m[14] = z;
+}
+
+static void hit_v(float *v, int *n, float x, float y, float z) {
+    v[*n * 3 + 0] = x;
+    v[*n * 3 + 1] = y;
+    v[*n * 3 + 2] = z;
+    ++(*n);
+}
+static void hit_line(float *v, int *n,
+                     float ax, float ay, float az,
+                     float bx, float by, float bz) {
+    hit_v(v, n, ax, ay, az);
+    hit_v(v, n, bx, by, bz);
+}
+
+static void hit_aabb_edges(float *v, int *n, const NcAabb6 &b) {
+    /* 12 edges => 24 vertices. */
+    hit_line(v,n,b.minx,b.miny,b.minz, b.maxx,b.miny,b.minz);
+    hit_line(v,n,b.maxx,b.miny,b.minz, b.maxx,b.miny,b.maxz);
+    hit_line(v,n,b.maxx,b.miny,b.maxz, b.minx,b.miny,b.maxz);
+    hit_line(v,n,b.minx,b.miny,b.maxz, b.minx,b.miny,b.minz);
+
+    hit_line(v,n,b.minx,b.maxy,b.minz, b.maxx,b.maxy,b.minz);
+    hit_line(v,n,b.maxx,b.maxy,b.minz, b.maxx,b.maxy,b.maxz);
+    hit_line(v,n,b.maxx,b.maxy,b.maxz, b.minx,b.maxy,b.maxz);
+    hit_line(v,n,b.minx,b.maxy,b.maxz, b.minx,b.maxy,b.minz);
+
+    hit_line(v,n,b.minx,b.miny,b.minz, b.minx,b.maxy,b.minz);
+    hit_line(v,n,b.maxx,b.miny,b.minz, b.maxx,b.maxy,b.minz);
+    hit_line(v,n,b.maxx,b.miny,b.maxz, b.maxx,b.maxy,b.maxz);
+    hit_line(v,n,b.minx,b.miny,b.maxz, b.minx,b.maxy,b.maxz);
+}
+
+static void hit_look_line(float *v, int *n, const NcAabb6 &b, float pitch, float yaw) {
+    const float k = 0.01745329251994329577f;
+    float p = pitch * k;
+    float y = yaw * k;
+    float cp = cosf(p), sp = sinf(p);
+    float sy = sinf(y), cy = cosf(y);
+
+    /* MC/PE convention: yaw 0 points toward -Z. */
+    float dx = -sy * cp;
+    float dy = -sp;
+    float dz =  cy * cp;
+
+    float sx = (b.minx + b.maxx) * 0.5f;
+    float sy0 = b.maxy - 0.12f;
+    float sz = (b.minz + b.maxz) * 0.5f;
+    const float len = 1.25f;
+    hit_line(v, n, sx, sy0, sz,
+             sx + dx * len, sy0 + dy * len, sz + dz * len);
+}
+
+static void hit_draw_entity(void *entity, const float *render_pos, float partial) {
+    if (!g_cfg.hitbox_on || !entity || !render_pos) return;
+    if (!hit_resolve_symbols() || !hit_init_gl()) return;
+
+    GLint depth_bits = 0;
+    glGetIntegerv(GL_DEPTH_BITS, &depth_bits);
+    if (depth_bits <= 0) return;
+
+    /* Exact Entity::bb storage in 1.1.5 is at +0x104. */
+    const NcAabb6 *aw = (const NcAabb6 *)((const unsigned char *)entity + 0x104);
+    NcAabb6 b = *aw;
+
+    /* The entity renderer receives interpolated position. The AABB tracks the
+     * actual entity position, so interpolate the box by the same delta. */
+    NcVec3 cur = {0,0,0};
+    NcVec3 interp = {0,0,0};
+    const float *cp = entity_getPos(entity);
+    if (cp) { cur.x = cp[0]; cur.y = cp[1]; cur.z = cp[2]; }
+    entity_getInterpolatedPosition(&interp, entity, partial);
+    float dx = interp.x - cur.x;
+    float dy = interp.y - cur.y;
+    float dz = interp.z - cur.z;
+    b.minx += dx; b.maxx += dx;
+    b.miny += dy; b.maxy += dy;
+    b.minz += dz; b.maxz += dz;
+
+    /* Convert world AABB to the coordinate system used by the entity render
+     * call: relative to the game's render/player offset.  render_pos =
+     * interpolated world position - dispatcher offset, therefore offset is
+     * interp - render_pos. */
+    float offx = interp.x - render_pos[0];
+    float offy = interp.y - render_pos[1];
+    float offz = interp.z - render_pos[2];
+    b.minx -= offx; b.maxx -= offx;
+    b.miny -= offy; b.maxy -= offy;
+    b.minz -= offz; b.maxz -= offz;
+
+    NcVec2 rot = {0,0};
+    entity_getInterpolatedRotation(&rot, entity, partial);
+
+    float verts[78]; /* 26 line segments' endpoints = 52? + line => 26 vertices actually 78 floats. */
+    int n = 0;
+    hit_aabb_edges(verts, &n, b);      /* 24 vertices */
+    hit_look_line(verts, &n, b, rot.x, rot.y); /* +2 */
+    if (n != 26) return;
+
+    if (*g_projection_slot == 0 || *g_view_slot == 0) return;
+    float proj[16], view[16], model[16], vm[16], mvp[16];
+    hit_copy_matrix(*g_projection_slot, proj);
+    hit_copy_matrix(*g_view_slot, view);
+    hit_translate(model, 0.0f, 0.0f, 0.0f);
+    hit_mul(vm, view, model);
+    hit_mul(mvp, proj, vm);
+
+    /* The vertices above are already in camera-relative coordinates. */
+    GLint old_prog = 0, old_array = 0, old_active_tex = GL_TEXTURE0, old_tex2d = 0;
+    GLint old_depth_func = GL_LEQUAL, old_blend_src_rgb = GL_ONE, old_blend_dst_rgb = GL_ZERO;
+    GLint old_blend_src_a = GL_ONE, old_blend_dst_a = GL_ZERO;
+    GLint old_cull_face = GL_BACK;
+    GLint old_scissor[4] = {0,0,0,0};
+    GLint old_viewport[4] = {0,0,0,0};
+    GLint old_elem = 0;
+    GLboolean old_depth = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean old_depth_mask = GL_TRUE;
+    GLboolean old_blend = glIsEnabled(GL_BLEND);
+    GLboolean old_cull = glIsEnabled(GL_CULL_FACE);
+    GLboolean old_scissor_en = glIsEnabled(GL_SCISSOR_TEST);
+    GLboolean old_color[4] = {GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE};
+
+    glGetIntegerv(GL_CURRENT_PROGRAM, &old_prog);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_array);
+    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &old_elem);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &old_active_tex);
+    glGetIntegerv(GL_DEPTH_FUNC, &old_depth_func);
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &old_depth_mask);
+    glGetIntegerv(GL_BLEND_SRC_RGB, &old_blend_src_rgb);
+    glGetIntegerv(GL_BLEND_DST_RGB, &old_blend_dst_rgb);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &old_blend_src_a);
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &old_blend_dst_a);
+    glGetIntegerv(GL_CULL_FACE, &old_cull_face);
+    glGetIntegerv(GL_SCISSOR_BOX, old_scissor);
+    glGetIntegerv(GL_VIEWPORT, old_viewport);
+    glGetBooleanv(GL_COLOR_WRITEMASK, old_color);
+
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_tex2d);
+
+    GLint old_attr_buf=0, old_attr_size=4, old_attr_type=GL_FLOAT, old_attr_stride=0, old_attr_norm=GL_FALSE;
+    GLint old_attr_enabled=0;
+    void *old_attr_ptr = 0;
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &old_attr_enabled);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &old_attr_buf);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_SIZE, &old_attr_size);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_TYPE, &old_attr_type);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &old_attr_stride);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &old_attr_norm);
+    glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER, &old_attr_ptr);
+
+    glUseProgram(g_hit_prog);
+    glUniformMatrix4fv(g_hit_mvp, 1, GL_FALSE, mvp);
+    glBindBuffer(GL_ARRAY_BUFFER, g_hit_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(float) * n * 3), verts, GL_STREAM_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * (GLsizei)sizeof(float), (const void *)0);
+
+    /* Depth test ON, depth writes OFF. No blending: crisp white/red lines. */
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+
+    glUniform4f(g_hit_col, 1.0f, 1.0f, 1.0f, 1.0f);
+    glDrawArrays(GL_LINES, 0, 24);
+    glUniform4f(g_hit_col, 1.0f, 0.10f, 0.10f, 1.0f);
+    glDrawArrays(GL_LINES, 24, 2);
+
+    /* Restore EVERYTHING we touched. */
+    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)old_attr_buf);
+    if (old_attr_enabled) glEnableVertexAttribArray(0);
+    else glDisableVertexAttribArray(0);
+    glVertexAttribPointer(0, old_attr_size, (GLenum)old_attr_type,
+                          (GLboolean)old_attr_norm, old_attr_stride, old_attr_ptr);
+    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)old_array);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)old_elem);
+    glUseProgram((GLuint)old_prog);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)old_tex2d);
+    glActiveTexture((GLenum)old_active_tex);
+    glDepthFunc((GLenum)old_depth_func);
+    glDepthMask(old_depth_mask);
+    if (old_depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    glBlendFuncSeparate((GLenum)old_blend_src_rgb, (GLenum)old_blend_dst_rgb,
+                        (GLenum)old_blend_src_a, (GLenum)old_blend_dst_a);
+    if (old_blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    glCullFace((GLenum)old_cull_face);
+    if (old_cull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+    glScissor(old_scissor[0], old_scissor[1], old_scissor[2], old_scissor[3]);
+    if (old_scissor_en) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    glViewport(old_viewport[0], old_viewport[1], old_viewport[2], old_viewport[3]);
+    glColorMask(old_color[0], old_color[1], old_color[2], old_color[3]);
+}
+
+static void hook_entity_render(void *self, void *entity, const void *pos, float yaw, float partial) {
+    if (g_orig_entity_render)
+        g_orig_entity_render(self, entity, pos, yaw, partial);
+    if (g_cfg.hitbox_on && entity && pos)
+        hit_draw_entity(entity, (const float *)pos, partial);
+}
+
 /* FPS optimizer: change what the game's option getters answer */
 static bool hook_fancy(void *s)   { if (g_cfg.perf_gfx)    return false; return g_orig_fancy   ? g_orig_fancy(s)   : true; }
 static bool hook_skies(void *s)   { if (g_cfg.perf_skies)  return false; return g_orig_skies   ? g_orig_skies(s)   : true; }
 static bool hook_light(void *s)   { if (g_cfg.perf_light)  return false; return g_orig_light   ? g_orig_light(s)   : true; }
 static bool hook_bobview(void *s) { if (g_cfg.perf_bob)    return false; return g_orig_bobview ? g_orig_bobview(s) : true; }
-static bool hook_hitbox(void *s)  { if (g_cfg.hitbox_on)   return true;  return g_orig_hitbox  ? g_orig_hitbox(s)  : false; }
-
-/* The 1.1.5 entity renderer has its own debug-box path.  Keep the game's
- * renderer/camera/depth handling intact; this hook only gates that entity
- * debug pass with the Night Client toggle. */
-static void hook_entity_debug(void *dispatcher, void *entity) {
-    if (!g_cfg.hitbox_on) return;
-    if (g_orig_entity_debug) g_orig_entity_debug(dispatcher, entity);
-}
-
-/* MCPE 1.1.5 does not call EntityRenderDispatcher::renderDebug() merely because
- * the debug-box option getter returns true.  Its normal entity render path
- * prepares the dispatcher/renderer state first.  Run the game's real debug
- * renderer immediately after each entity finishes its normal render, while
- * that exact dispatcher/entity pair is still active. */
-static void hook_entity_render(void *dispatcher, void *entity, const void *pos, float yaw, float dt) {
-    if (g_orig_entity_render) g_orig_entity_render(dispatcher, entity, pos, yaw, dt);
-    if (g_cfg.hitbox_on && dispatcher && entity && g_orig_entity_debug)
-        g_orig_entity_debug(dispatcher, entity);
-}
-
 static int  hook_view(void *s) {
     int v = g_orig_view ? g_orig_view(s) : 8;
     if (g_cfg.perf_view_on && v > g_cfg.perf_view) v = g_cfg.perf_view;
@@ -1190,12 +1538,7 @@ static void nc_init(void) {
         "_ZN20ClientInputCallbacks21handlePointerLocationER14ClientInstanceRK24PointerLocationEventData11FocusImpact",
         (void *)hook_ptr, (void **)&g_orig_ptr);
     if (g_cfg.hook_hitbox) {
-        /* Keep the option hook harmless, but do not rely on it to trigger the
-         * debug pass.  We explicitly invoke the verified 1.1.5 dispatcher
-         * debug method from the verified entity render path below. */
-        reg("hitboxes option", "_ZNK7Options25getDevRenderBoundingBoxesEv", (void *)hook_hitbox, (void **)&g_orig_hitbox);
-        reg("entity hitbox renderer", "_ZN22EntityRenderDispatcher11renderDebugER6Entity", (void *)hook_entity_debug, (void **)&g_orig_entity_debug);
-        reg("entity render", "_ZN22EntityRenderDispatcher6renderER6EntityRK4Vec3ff", (void *)hook_entity_render, (void **)&g_orig_entity_render);
+        reg("entity render hitboxes", "_ZN22EntityRenderDispatcher6renderER6EntityRK4Vec3ff", (void *)hook_entity_render, (void **)&g_orig_entity_render);
     }
     if (g_cfg.hook_perf) {
         reg("fast graphics", "_ZNK7Options16getFancyGraphicsEv", (void *)hook_fancy, (void **)&g_orig_fancy);
