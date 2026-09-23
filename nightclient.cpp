@@ -387,8 +387,8 @@ static void draw_custom_hitboxes(int w,int h){
     GLint old_prog=0, old_vbo=0, old_depth_func=GL_LEQUAL;
     GLboolean old_depth=glIsEnabled(GL_DEPTH_TEST);
     GLboolean old_depth_mask=GL_TRUE;
-    GLboolean old_attr0=GLint old_attr0 = 0;
-glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &old_attr0);
+    GLint old_attr0=0;
+    glGetVertexAttribiv(0,GL_VERTEX_ATTRIB_ARRAY_ENABLED,&old_attr0);
     glGetIntegerv(GL_CURRENT_PROGRAM,&old_prog);
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING,&old_vbo);
     glGetIntegerv(GL_DEPTH_FUNC,&old_depth_func);
