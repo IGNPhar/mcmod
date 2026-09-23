@@ -344,23 +344,12 @@ static void hit_head(float *v,int *n,float x,float y,float z,float pitch,float y
 static void mat_ident(float *m){memset(m,0,16*sizeof(float));m[0]=m[5]=m[10]=m[15]=1.0f;}
 static void mat_mult(float *o,const float *a,const float *b){float r[16];for(int c=0;c<4;c++)for(int rr=0;rr<4;rr++)r[c*4+rr]=a[rr]*b[c*4]+a[4+rr]*b[c*4+1]+a[8+rr]*b[c*4+2]+a[12+rr]*b[c*4+3];memcpy(o,r,sizeof(r));}
 static void hit_view(float *m,const float *cam,float pitch,float yaw){
-    /* EntityRenderDispatcher::render(Entity&, Vec3 const&, ...) receives a
-     * camera-relative Vec3 in this 1.1.5 binary.  Do NOT subtract the camera
-     * position again here; doing so pushes every box far away and makes the
-     * hitboxes appear to be missing.  We only rotate those already-relative
-     * coordinates into camera space. */
-    (void)cam;
-    float p=pitch*0.01745329252f,q=yaw*0.01745329252f;
-    float cp=cosf(p),sp=sinf(p),sy=sinf(q),cy=cosf(q);
-    float fx=-sy*cp, fy=-sp, fz=cy*cp;
-    float rx=-cy, rz=-sy;
-    float ux=rz*fy, uy=-rz*fx+rx*fz, uz=-rx*fy;
-
+    float p=pitch*0.01745329252f,q=yaw*0.01745329252f,cp=cosf(p),sp=sinf(p),sy=sinf(q),cy=cosf(q);
+    float fx=-sy*cp,fy=-sp,fz=cy*cp,rx=cy,rz=sy,ux=rz*fy,uy=-rz*fx+rx*fz,uz=-rx*fy;
     mat_ident(m);
-    /* Camera-space basis: right, up, and -forward. */
-    m[0]=rx;  m[4]=0.0f; m[8]=rz;  m[12]=0.0f;
-    m[1]=ux;  m[5]=uy;   m[9]=uz;  m[13]=0.0f;
-    m[2]=-fx; m[6]=-fy;  m[10]=-fz;m[14]=0.0f;
+    m[0]=rx;m[4]=0;m[8]=rz;m[12]=-(rx*cam[0]+rz*cam[2]);
+    m[1]=ux;m[5]=uy;m[9]=uz;m[13]=-(ux*cam[0]+uy*cam[1]+uz*cam[2]);
+    m[2]=-fx;m[6]=-fy;m[10]=-fz;m[14]=fx*cam[0]+fy*cam[1]+fz*cam[2];
 }
 static void hit_proj(float *m,float fov,float aspect,float zn,float zf){
     mat_ident(m);float f=1.0f/tanf(fov*0.5f*0.01745329252f);m[0]=f/aspect;m[5]=f;m[10]=(zf+zn)/(zn-zf);m[11]=-1.0f;m[14]=(2.0f*zf*zn)/(zn-zf);m[15]=0.0f;
@@ -435,16 +424,10 @@ static void draw_custom_hitboxes(int w,int h){
 }
 static void hook_entity_render(void *self,void *entity,const void *pos,float yaw,float dt){
     if(g_cfg.hitbox_on&&self&&entity&&pos){
-        const float*p=(const float*)pos;const float*cr=dispatcher_getCameraRot(self);
-        if(cr){g_hit_rot[0]=cr[0];g_hit_rot[1]=cr[1];}
+        const float*p=(const float*)pos;const float*cp=dispatcher_getCameraPos(self),*cr=dispatcher_getCameraRot(self);
+        if(cp){g_hit_cam[0]=cp[0];g_hit_cam[1]=cp[1];g_hit_cam[2]=cp[2];}if(cr){g_hit_rot[0]=cr[0];g_hit_rot[1]=cr[1];}
         int at=-1;for(int i=0;i<g_hit_count;i++)if(g_hit_entities[i].ptr==entity){at=i;break;}if(at<0&&g_hit_count<(int)(sizeof(g_hit_entities)/sizeof(g_hit_entities[0])))at=g_hit_count++;
-        if(at>=0){
-            g_hit_entities[at].ptr=entity;
-            g_hit_entities[at].x=p[0]; g_hit_entities[at].y=p[1]; g_hit_entities[at].z=p[2];
-            NcVec2 r={0,0}; entity_getRotation(&r,entity);
-            g_hit_entities[at].pitch=isfinite(r.x)?r.x:0.0f;
-            g_hit_entities[at].yaw=isfinite(r.y)?r.y:yaw;
-        }
+        if(at>=0){g_hit_entities[at].ptr=entity;g_hit_entities[at].x=p[0];g_hit_entities[at].y=p[1];g_hit_entities[at].z=p[2];NcVec2 r={0,0};entity_getRotation(&r,entity);g_hit_entities[at].pitch=isfinite(r.x)?r.x:0.0f;g_hit_entities[at].yaw=isfinite(r.y)?r.y:yaw;}
     }
     if(g_orig_entity_render)g_orig_entity_render(self,entity,pos,yaw,dt);
 }
@@ -1339,9 +1322,6 @@ static void nc_init(void) {
         "_ZN20ClientInputCallbacks21handlePointerLocationER14ClientInstanceRK24PointerLocationEventData11FocusImpact",
         (void *)hook_ptr, (void **)&g_orig_ptr);
     if (g_cfg.hook_hitbox) {
-        /* This exact 1.1.5 overload is verified in libminecraftpe.so. Its Vec3
-         * argument is already camera-relative (the one-argument wrapper
-         * subtracts the dispatcher camera position before calling it). */
         reg("custom entity hitboxes", "_ZN22EntityRenderDispatcher6renderER6EntityRK4Vec3ff",
             (void *)hook_entity_render, (void **)&g_orig_entity_render);
     }
