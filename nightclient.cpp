@@ -68,6 +68,10 @@ extern "C" const float *entity_getPos(void *self) __asm__("_ZNK6Entity6getPosEv"
 struct NcVec2 { float x, y; };
 extern "C" void entity_getRotation(NcVec2 *out, void *self) __asm__("_ZNK6Entity11getRotationEv");
 
+/* Verified MCPE 1.1.5 debug renderer entry point. */
+extern "C" void entity_dispatch_renderDebug(void *renderer, void *entity)
+    __asm__("_ZN19EntityRenderDispatcher11renderDebugER6Entity");
+
 /* ---- Toolbox mod loader: hook registration (libmodloader.so) ---- */
 extern "C" void tml_registerHook(const char *symbol, void *hook, void **original)
     __asm__("_ZN3tml17StaticHookManager12registerHookEPKcPvPS3_");
@@ -140,6 +144,7 @@ typedef float (*fn_fov)(void *, float, bool);
 typedef int   (*fn_ptr)(void *, void *, void *, int);
 typedef bool  (*fn_getb)(void *);
 typedef int   (*fn_geti)(void *);
+typedef void  (*fn_entity_debug)(void *, void *);
 static fn_this  g_orig_onOpen = 0, g_orig_dtor = 0;
 static fn_tick  g_orig_tick = 0;
 static fn_apply g_orig_apply = 0;
@@ -148,6 +153,7 @@ static fn_fov   g_orig_fov = 0;
 static fn_ptr   g_orig_ptr = 0;
 static fn_getb  g_orig_fancy = 0, g_orig_skies = 0, g_orig_light = 0, g_orig_bobview = 0, g_orig_hitbox = 0;
 static fn_geti  g_orig_view = 0;
+static fn_entity_debug g_orig_entity_debug = 0;
 
 static int snapshot_arrow_count(void *player) {
     /*
@@ -286,22 +292,11 @@ static bool hook_light(void *s)   { if (g_cfg.perf_light)  return false; return 
 static bool hook_bobview(void *s) { if (g_cfg.perf_bob)    return false; return g_orig_bobview ? g_orig_bobview(s) : true; }
 static bool hook_hitbox(void *s)  { if (g_cfg.hitbox_on)   return true;  return g_orig_hitbox  ? g_orig_hitbox(s)  : false; }
 
-/* Exact 1.1.5 entity-dispatcher render path.  We let the game finish its
- * normal entity render first, then invoke its existing world-space debug
- * primitive while the dispatcher/camera are active.  This keeps depth testing
- * in the game's renderer instead of drawing an ImGui overlay through walls. */
-typedef void (*fn_entity_render)(void *, void *, const void *, float, float);
-static fn_entity_render g_orig_entity_render = 0;
-
-extern "C" void entity_dispatch_renderDebug(void *self, void *entity)
-    __asm__("_ZN22EntityRenderDispatcher11renderDebugER6Entity");
-
-static void hook_entity_render(void *self, void *entity, const void *pos, float yaw, float dt) {
-    if (g_orig_entity_render)
-        g_orig_entity_render(self, entity, pos, yaw, dt);
-
-    if (g_cfg.hitbox_on && self && entity)
-        entity_dispatch_renderDebug(self, entity);
+/* The 1.1.5 entity renderer has its own debug-box path.  Keep the game's
+ * renderer/camera/depth handling intact; this hook only gates that entity
+ * debug pass with the Night Client toggle. */
+static void hook_entity_debug(void *renderer, void *entity) {
+    if (g_orig_entity_debug) g_orig_entity_debug(renderer, entity);
 }
 
 static int  hook_view(void *s) {
@@ -1184,11 +1179,10 @@ static void nc_init(void) {
     if (g_cfg.hook_persp) reg("perspective",
         "_ZN20ClientInputCallbacks21handlePointerLocationER14ClientInstanceRK24PointerLocationEventData11FocusImpact",
         (void *)hook_ptr, (void **)&g_orig_ptr);
-    /* Always install the hitbox hooks so the module can be toggled from the
-     * menu without requiring a restart.  The hooks are inert while disabled. */
-    reg("hitboxes option", "_ZNK7Options25getDevRenderBoundingBoxesEv", (void *)hook_hitbox, (void **)&g_orig_hitbox);
-    reg("entity render", "_ZN22EntityRenderDispatcher6renderER6EntityRK4Vec3ff",
-        (void *)hook_entity_render, (void **)&g_orig_entity_render);
+    if (g_cfg.hook_hitbox) {
+        reg("hitboxes option", "_ZNK7Options25getDevRenderBoundingBoxesEv", (void *)hook_hitbox, (void **)&g_orig_hitbox);
+        reg("entity hitbox renderer", "_ZN19EntityRenderDispatcher11renderDebugER6Entity", (void *)hook_entity_debug, (void **)&g_orig_entity_debug);
+    }
     if (g_cfg.hook_perf) {
         reg("fast graphics", "_ZNK7Options16getFancyGraphicsEv", (void *)hook_fancy, (void **)&g_orig_fancy);
         reg("fancy skies", "_ZNK7Options13getFancySkiesEv", (void *)hook_skies, (void **)&g_orig_skies);
