@@ -56,10 +56,6 @@ extern "C" void cic_drop(void *self, void *ci)
     __asm__("_ZN20ClientInputCallbacks21handleDropButtonPressER14ClientInstance");
 extern "C" const void *player_getSelectedItem(void *self) __asm__("_ZNK6Player15getSelectedItemEv");
 extern "C" const float *entity_getPos(void *self) __asm__("_ZNK6Entity6getPosEv");
-extern "C" const float *dispatcher_getCameraPos(void *self)
-    __asm__("_ZN22EntityRenderDispatcher12getCameraPosEv");
-extern "C" const float *dispatcher_getCameraRot(void *self)
-    __asm__("_ZN22EntityRenderDispatcher12getCameraRotEv");
 /*
  * Arrow inventory access is intentionally not called yet.
  *
@@ -144,7 +140,7 @@ typedef float (*fn_fov)(void *, float, bool);
 typedef int   (*fn_ptr)(void *, void *, void *, int);
 typedef bool  (*fn_getb)(void *);
 typedef int   (*fn_geti)(void *);
-typedef void  (*fn_entity_render)(void *, void *, const void *, float, float);
+typedef void  (*fn_entity_debug)(void *, void *);
 static fn_this  g_orig_onOpen = 0, g_orig_dtor = 0;
 static fn_tick  g_orig_tick = 0;
 static fn_apply g_orig_apply = 0;
@@ -153,21 +149,7 @@ static fn_fov   g_orig_fov = 0;
 static fn_ptr   g_orig_ptr = 0;
 static fn_getb  g_orig_fancy = 0, g_orig_skies = 0, g_orig_light = 0, g_orig_bobview = 0, g_orig_hitbox = 0;
 static fn_geti  g_orig_view = 0;
-static fn_entity_render g_orig_entity_render = 0;
-
-struct NcHitEntity {
-    const void *ptr;
-    float x, y, z;
-    float pitch, yaw;
-};
-static NcHitEntity g_hit_entities[96];
-static int g_hit_count = 0;
-static float g_hit_cam[3] = {0.0f, 0.0f, 0.0f};
-static float g_hit_rot[2] = {0.0f, 0.0f};
-static float g_live_fov = 70.0f;
-static GLuint g_hit_prog = 0, g_hit_vbo = 0;
-static GLint g_hit_mvp = -1, g_hit_col = -1;
-static bool g_hit_gl_ready = false;
+static fn_entity_debug g_orig_entity_debug = 0;
 
 static int snapshot_arrow_count(void *player) {
     /*
@@ -287,7 +269,6 @@ static void hook_bobhurt(void *self, void *m, float t) {
 static float hook_fov(void *self, float pt, bool world) {
     float f = g_orig_fov ? g_orig_fov(self, pt, world) : 70.0f;
     if (!world) return f;                       /* the call with flag=false is the hand: leave it alone */
-    if (isfinite(f) && f > 20.0f && f < 140.0f) g_live_fov = f;
     float target = (g_cfg.zoom_on && g_zoom_active) ? g_cfg.zoom_level : 1.0f;
     g_zoom_cur += (target - g_zoom_cur) * 0.30f;
     if (fabsf(target - g_zoom_cur) < 0.01f) g_zoom_cur = target;
@@ -301,142 +282,20 @@ static int hook_ptr(void *self, void *ci, void *data, int focus) {
 }
 
 /* FPS optimizer: change what the game's option getters answer */
-/* ------------------------------------------------------------------ custom 3-D hitbox renderer */
-static GLuint hit_compile_shader(GLenum type, const char *src) {
-    GLuint sh = glCreateShader(type);
-    if (!sh) return 0;
-    glShaderSource(sh, 1, &src, 0);
-    glCompileShader(sh);
-    GLint ok = 0; glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
-    if (!ok) { glDeleteShader(sh); return 0; }
-    return sh;
-}
-static bool hit_init_gl() {
-    if (g_hit_gl_ready) return true;
-    const char *vs = "attribute vec3 aPos; uniform mat4 uMVP; void main(){ gl_Position=uMVP*vec4(aPos,1.0); }";
-    const char *fs = "precision mediump float; uniform vec4 uColor; void main(){ gl_FragColor=uColor; }";
-    GLuint v=hit_compile_shader(GL_VERTEX_SHADER,vs), f=hit_compile_shader(GL_FRAGMENT_SHADER,fs);
-    if (!v || !f) { if(v)glDeleteShader(v); if(f)glDeleteShader(f); return false; }
-    GLuint p=glCreateProgram();
-    if(!p){glDeleteShader(v);glDeleteShader(f);return false;}
-    glAttachShader(p,v); glAttachShader(p,f); glBindAttribLocation(p,0,"aPos"); glLinkProgram(p);
-    glDeleteShader(v); glDeleteShader(f);
-    GLint ok=0; glGetProgramiv(p,GL_LINK_STATUS,&ok);
-    if(!ok){glDeleteProgram(p);return false;}
-    g_hit_prog=p; g_hit_mvp=glGetUniformLocation(p,"uMVP"); g_hit_col=glGetUniformLocation(p,"uColor");
-    glGenBuffers(1,&g_hit_vbo);
-    if(!g_hit_vbo || g_hit_mvp<0 || g_hit_col<0){ if(g_hit_vbo)glDeleteBuffers(1,&g_hit_vbo); glDeleteProgram(g_hit_prog); g_hit_prog=0; return false; }
-    g_hit_gl_ready=true; nclog("custom hitbox GL initialized"); return true;
-}
-static void hit_v(float *v,int *n,float x,float y,float z){ if(*n>=4096)return; v[*n*3]=x;v[*n*3+1]=y;v[*n*3+2]=z;(*n)++; }
-static void hit_l(float *v,int *n,float ax,float ay,float az,float bx,float by,float bz){hit_v(v,n,ax,ay,az);hit_v(v,n,bx,by,bz);}
-static void hit_box(float *v,int *n,float x,float y,float z,float hw,float h){
-    float x0=x-hw,x1=x+hw,z0=z-hw,z1=z+hw,y0=y,y1=y+h;
-    hit_l(v,n,x0,y0,z0,x1,y0,z0); hit_l(v,n,x1,y0,z0,x1,y0,z1); hit_l(v,n,x1,y0,z1,x0,y0,z1); hit_l(v,n,x0,y0,z1,x0,y0,z0);
-    hit_l(v,n,x0,y1,z0,x1,y1,z0); hit_l(v,n,x1,y1,z0,x1,y1,z1); hit_l(v,n,x1,y1,z1,x0,y1,z1); hit_l(v,n,x0,y1,z1,x0,y1,z0);
-    hit_l(v,n,x0,y0,z0,x0,y1,z0); hit_l(v,n,x1,y0,z0,x1,y1,z0); hit_l(v,n,x1,y0,z1,x1,y1,z1); hit_l(v,n,x0,y0,z1,x0,y1,z1);
-}
-static void hit_head(float *v,int *n,float x,float y,float z,float pitch,float yaw){
-    float p=pitch*0.01745329252f,q=yaw*0.01745329252f,cp=cosf(p),sp=sinf(p),sy=sinf(q),cy=cosf(q);
-    float fx=-sy*cp,fy=-sp,fz=cy*cp,len=1.25f,oy=y+1.62f;
-    hit_l(v,n,x,oy,z,x+fx*len,oy+fy*len,z+fz*len);
-}
-static void mat_ident(float *m){memset(m,0,16*sizeof(float));m[0]=m[5]=m[10]=m[15]=1.0f;}
-static void mat_mult(float *o,const float *a,const float *b){float r[16];for(int c=0;c<4;c++)for(int rr=0;rr<4;rr++)r[c*4+rr]=a[rr]*b[c*4]+a[4+rr]*b[c*4+1]+a[8+rr]*b[c*4+2]+a[12+rr]*b[c*4+3];memcpy(o,r,sizeof(r));}
-static void hit_view(float *m,const float *cam,float pitch,float yaw){
-    float p=pitch*0.01745329252f,q=yaw*0.01745329252f,cp=cosf(p),sp=sinf(p),sy=sinf(q),cy=cosf(q);
-    float fx=-sy*cp,fy=-sp,fz=cy*cp,rx=cy,rz=sy,ux=rz*fy,uy=-rz*fx+rx*fz,uz=-rx*fy;
-    mat_ident(m);
-    m[0]=rx;m[4]=0;m[8]=rz;m[12]=-(rx*cam[0]+rz*cam[2]);
-    m[1]=ux;m[5]=uy;m[9]=uz;m[13]=-(ux*cam[0]+uy*cam[1]+uz*cam[2]);
-    m[2]=-fx;m[6]=-fy;m[10]=-fz;m[14]=fx*cam[0]+fy*cam[1]+fz*cam[2];
-}
-static void hit_proj(float *m,float fov,float aspect,float zn,float zf){
-    mat_ident(m);float f=1.0f/tanf(fov*0.5f*0.01745329252f);m[0]=f/aspect;m[5]=f;m[10]=(zf+zn)/(zn-zf);m[11]=-1.0f;m[14]=(2.0f*zf*zn)/(zn-zf);m[15]=0.0f;
-}
-static void draw_custom_hitboxes(int w,int h){
-    if(!g_cfg.hitbox_on||g_hit_count<=0||w<=0||h<=0) return;
-    if(!hit_init_gl()) return;
-
-    /* The previous version changed several unrelated GL states (blend, cull,
-     * scissor, etc.).  On 1.1.5 that state is still needed by the game's/UI
-     * renderer, which is why enabling hitboxes could make the whole frame turn
-     * black/transparent.  Keep this pass deliberately tiny: only touch the
-     * program, VBO/attribute 0, and depth state, and restore every value. */
-    GLint depth_bits = 0;
-    glGetIntegerv(GL_DEPTH_BITS, &depth_bits);
-    if(depth_bits <= 0) {
-        if(!g_gl_err_logged) nclog("custom hitboxes: no depth buffer on current surface");
-        return;
-    }
-
-    static float verts[4096*3];
-    int n=0;
-    for(int i=0;i<g_hit_count;i++){
-        const NcHitEntity &e=g_hit_entities[i];
-        hit_box(verts,&n,e.x,e.y,e.z,0.30f,1.80f);
-        hit_head(verts,&n,e.x,e.y,e.z,e.pitch,e.yaw);
-    }
-    if(!n) return;
-
-    float view[16],proj[16],mvp[16];
-    hit_view(view,g_hit_cam,g_hit_rot[0],g_hit_rot[1]);
-    hit_proj(proj,clampf(g_live_fov,30.0f,120.0f),(float)w/(float)h,0.05f,512.0f);
-    mat_mult(mvp,proj,view);
-
-    GLint old_prog=0, old_vbo=0, old_depth_func=GL_LEQUAL;
-    GLboolean old_depth=glIsEnabled(GL_DEPTH_TEST);
-    GLboolean old_depth_mask=GL_TRUE;
-    GLint old_attr0=0;
-    glGetVertexAttribiv(0,GL_VERTEX_ATTRIB_ARRAY_ENABLED,&old_attr0);
-    glGetIntegerv(GL_CURRENT_PROGRAM,&old_prog);
-    glGetIntegerv(GL_ARRAY_BUFFER_BINDING,&old_vbo);
-    glGetIntegerv(GL_DEPTH_FUNC,&old_depth_func);
-    glGetBooleanv(GL_DEPTH_WRITEMASK,&old_depth_mask);
-
-    glUseProgram(g_hit_prog);
-    glUniformMatrix4fv(g_hit_mvp,1,GL_FALSE,mvp);
-    glBindBuffer(GL_ARRAY_BUFFER,g_hit_vbo);
-    glBufferData(GL_ARRAY_BUFFER,(GLsizeiptr)(n*3*(int)sizeof(float)),verts,GL_STREAM_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,3*(GLsizei)sizeof(float),(const void*)0);
-
-    /* Depth-test the lines so blocks can occlude them, but never write depth. */
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LEQUAL);
-    glDepthMask(GL_FALSE);
-
-    for(int i=0;i<g_hit_count;i++){
-        glUniform4f(g_hit_col,0.20f,0.65f,1.0f,1.0f);
-        glDrawArrays(GL_LINES,i*26,24);
-        glUniform4f(g_hit_col,1.0f,0.18f,0.18f,1.0f);
-        glDrawArrays(GL_LINES,i*26+24,2);
-    }
-
-    if(old_attr0) glEnableVertexAttribArray(0);
-    else          glDisableVertexAttribArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER,(GLuint)old_vbo);
-    glUseProgram((GLuint)old_prog);
-    glDepthFunc((GLenum)old_depth_func);
-    glDepthMask(old_depth_mask);
-    if(old_depth) glEnable(GL_DEPTH_TEST);
-    else          glDisable(GL_DEPTH_TEST);
-}
-static void hook_entity_render(void *self,void *entity,const void *pos,float yaw,float dt){
-    if(g_cfg.hitbox_on&&self&&entity&&pos){
-        const float*p=(const float*)pos;const float*cp=dispatcher_getCameraPos(self),*cr=dispatcher_getCameraRot(self);
-        if(cp){g_hit_cam[0]=cp[0];g_hit_cam[1]=cp[1];g_hit_cam[2]=cp[2];}if(cr){g_hit_rot[0]=cr[0];g_hit_rot[1]=cr[1];}
-        int at=-1;for(int i=0;i<g_hit_count;i++)if(g_hit_entities[i].ptr==entity){at=i;break;}if(at<0&&g_hit_count<(int)(sizeof(g_hit_entities)/sizeof(g_hit_entities[0])))at=g_hit_count++;
-        if(at>=0){g_hit_entities[at].ptr=entity;g_hit_entities[at].x=p[0];g_hit_entities[at].y=p[1];g_hit_entities[at].z=p[2];NcVec2 r={0,0};entity_getRotation(&r,entity);g_hit_entities[at].pitch=isfinite(r.x)?r.x:0.0f;g_hit_entities[at].yaw=isfinite(r.y)?r.y:yaw;}
-    }
-    if(g_orig_entity_render)g_orig_entity_render(self,entity,pos,yaw,dt);
-}
-
-/* FPS optimizer: change what the game's option getters answer */
 static bool hook_fancy(void *s)   { if (g_cfg.perf_gfx)    return false; return g_orig_fancy   ? g_orig_fancy(s)   : true; }
-static bool hook_skies(void *s)   { if (g_cfg.perf_skies)  return false; return g_orig_skies  ? g_orig_skies(s)  : true; }
-static bool hook_light(void *s)   { if (g_cfg.perf_light)  return false; return g_orig_light  ? g_orig_light(s)  : true; }
+static bool hook_skies(void *s)   { if (g_cfg.perf_skies)  return false; return g_orig_skies   ? g_orig_skies(s)   : true; }
+static bool hook_light(void *s)   { if (g_cfg.perf_light)  return false; return g_orig_light   ? g_orig_light(s)   : true; }
 static bool hook_bobview(void *s) { if (g_cfg.perf_bob)    return false; return g_orig_bobview ? g_orig_bobview(s) : true; }
+static bool hook_hitbox(void *s)  { if (g_cfg.hitbox_on)   return true;  return g_orig_hitbox  ? g_orig_hitbox(s)  : false; }
+
+/* The 1.1.5 entity renderer has its own debug-box path.  Keep the game's
+ * renderer/camera/depth handling intact; this hook only gates that entity
+ * debug pass with the Night Client toggle. */
+static void hook_entity_debug(void *dispatcher, void *entity) {
+    if (!g_cfg.hitbox_on) return;
+    if (g_orig_entity_debug) g_orig_entity_debug(dispatcher, entity);
+}
+
 static int  hook_view(void *s) {
     int v = g_orig_view ? g_orig_view(s) : 8;
     if (g_cfg.perf_view_on && v > g_cfg.perf_view) v = g_cfg.perf_view;
@@ -985,10 +844,11 @@ static void panel_persp() {
     ImGui::TextDisabled("Works after you have touched the screen in a world once.");
 }
 static void panel_hitbox() {
-    head("Hitboxes", &g_cfg.hitbox_on, "Custom 3-D entity hitboxes, drawn with the world depth buffer.");
-    ImGui::TextDisabled("Blue wire boxes are drawn around rendered entities and are hidden by blocks.");
-    ImGui::TextDisabled("A red line starts at the head and shows the entity's look direction.");
-    ImGui::TextDisabled("This first pass uses a stable player/mob-sized box for every rendered entity.");
+    head("Hitboxes", &g_cfg.hitbox_on, "Turns on the game's own developer bounding-box renderer.");
+    ImGui::TextDisabled("This shows every entity's and block's box, drawn by the game itself, so it renders");
+    ImGui::TextDisabled("correctly through everything the game already handles (distance, walls, etc).");
+    ImGui::TextDisabled("There is no separate colour for a thrown ender pearl yet - tell me what it looks");
+    ImGui::TextDisabled("like once you can see it and I will try to single it out next.");
 }
 static void panel_perf() {
     head("FPS optimizer", 0, "Lower some graphics settings for more FPS. Each one is separate.");
@@ -1142,8 +1002,6 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     if (need && !g_drawing_logged) { g_drawing_logged = true; nclog("drawing started"); }
 
     if (!need) {
-        if (g_cfg.hitbox_on && in_world && !g_menu_open && !g_edit) draw_custom_hitboxes((int)w, (int)h);
-        g_hit_count = 0;
         pthread_mutex_lock(&g_mu);
         NcTouch keep_cap = g_touch;                    /* keep the finger id; hide every rect */
         nc_touch_init(&g_touch); g_touch.cap_id = keep_cap.cap_id;
@@ -1151,9 +1009,6 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
         pthread_mutex_unlock(&g_mu);
         return;
     }
-
-    if (g_cfg.hitbox_on && in_world && !g_menu_open && !g_edit) draw_custom_hitboxes((int)w, (int)h);
-    g_hit_count = 0;
 
     if (!g_imgui_ready) {
         if (!init_imgui(w, h)) { g_imgui_failed = true; return; }
@@ -1322,8 +1177,8 @@ static void nc_init(void) {
         "_ZN20ClientInputCallbacks21handlePointerLocationER14ClientInstanceRK24PointerLocationEventData11FocusImpact",
         (void *)hook_ptr, (void **)&g_orig_ptr);
     if (g_cfg.hook_hitbox) {
-        reg("custom entity hitboxes", "_ZN22EntityRenderDispatcher6renderER6EntityRK4Vec3ff",
-            (void *)hook_entity_render, (void **)&g_orig_entity_render);
+        reg("hitboxes option", "_ZNK7Options25getDevRenderBoundingBoxesEv", (void *)hook_hitbox, (void **)&g_orig_hitbox);
+        reg("entity hitbox renderer", "_ZN22EntityRenderDispatcher11renderDebugER6Entity", (void *)hook_entity_debug, (void **)&g_orig_entity_debug);
     }
     if (g_cfg.hook_perf) {
         reg("fast graphics", "_ZNK7Options16getFancyGraphicsEv", (void *)hook_fancy, (void **)&g_orig_fancy);
