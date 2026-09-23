@@ -28,7 +28,8 @@ extern "C" {
   X(zoom_alpha,   F, 0.85, 0.0, 1) X(zoom_text_alpha, F, 1.0, 0.0, 1) X(zoom_level, F, 4.0, 1.5, 12) X(zoom_label, I, 0, 0, 7) \
   X(zoom_col,     I, 0x38306E, 0, 0xFFFFFF) X(zoom_pause, I, 0, 0, 1) \
   X(persp_on,     I, 0,    0, 1) X(persp_x, F, 0.90, 0, 1) X(persp_y, F, 0.46, 0, 1) X(persp_btn, F, 3.0, 1.0, 8.0) \
-  X(persp_alpha,  F, 0.85, 0.1, 1) X(persp_label, I, 0, 0, 7) \
+  X(persp_alpha,  F, 0.85, 0.1, 1)\
+  X(persp_text_alpha, F, 1.0, 0.0, 1) X(persp_label, I, 0, 0, 7) \
   X(persp_col,    I, 0x38306E, 0, 0xFFFFFF) X(persp_pause, I, 0, 0, 1) \
   X(drop_on,      I, 0,    0, 1) X(drop_x, F, 0.90, 0, 1) X(drop_y, F, 0.62, 0, 1) X(drop_btn, F, 3.0, 1.0, 8.0) \
   X(drop_alpha,   F, 0.85, 0.0, 1) X(drop_text_alpha, F, 1.0, 0.0, 1) X(drop_label, I, 0, 0, 7) X(drop_col, I, 0x38306E, 0, 0xFFFFFF) X(drop_pause, I, 0, 0, 1) \
