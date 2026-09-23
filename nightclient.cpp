@@ -33,7 +33,7 @@ extern "C" {
 #include "nc_font.h"
 #include "nc_icons.h"
 
-#define NC_VERSION "0.4.3"
+#define NC_VERSION "0.4.4"
 #define NC_DIR "/sdcard/games/com.mojang/NightClient/"
 #define NC_CFG NC_DIR "config.txt"
 #define NC_LOG NC_DIR "log.txt"
@@ -140,6 +140,7 @@ typedef float (*fn_fov)(void *, float, bool);
 typedef int   (*fn_ptr)(void *, void *, void *, int);
 typedef bool  (*fn_getb)(void *);
 typedef int   (*fn_geti)(void *);
+typedef void  (*fn_entity_debug)(void *, void *, void *);
 static fn_this  g_orig_onOpen = 0, g_orig_dtor = 0;
 static fn_tick  g_orig_tick = 0;
 static fn_apply g_orig_apply = 0;
@@ -148,6 +149,7 @@ static fn_fov   g_orig_fov = 0;
 static fn_ptr   g_orig_ptr = 0;
 static fn_getb  g_orig_fancy = 0, g_orig_skies = 0, g_orig_light = 0, g_orig_bobview = 0, g_orig_hitbox = 0;
 static fn_geti  g_orig_view = 0;
+static fn_entity_debug g_orig_entity_debug = 0;
 
 static int snapshot_arrow_count(void *player) {
     /*
@@ -285,6 +287,15 @@ static bool hook_skies(void *s)   { if (g_cfg.perf_skies)  return false; return 
 static bool hook_light(void *s)   { if (g_cfg.perf_light)  return false; return g_orig_light   ? g_orig_light(s)   : true; }
 static bool hook_bobview(void *s) { if (g_cfg.perf_bob)    return false; return g_orig_bobview ? g_orig_bobview(s) : true; }
 static bool hook_hitbox(void *s)  { if (g_cfg.hitbox_on)   return true;  return g_orig_hitbox  ? g_orig_hitbox(s)  : false; }
+
+/* The 1.1.5 entity renderer has its own debug-box path.  Keep the game's
+ * renderer/camera/depth handling intact; this hook only gates that entity
+ * debug pass with the Night Client toggle. */
+static void hook_entity_debug(void *renderer, void *entity, void *options) {
+    if (!g_cfg.hitbox_on) return;
+    if (g_orig_entity_debug) g_orig_entity_debug(renderer, entity, options);
+}
+
 static int  hook_view(void *s) {
     int v = g_orig_view ? g_orig_view(s) : 8;
     if (g_cfg.perf_view_on && v > g_cfg.perf_view) v = g_cfg.perf_view;
@@ -1165,7 +1176,10 @@ static void nc_init(void) {
     if (g_cfg.hook_persp) reg("perspective",
         "_ZN20ClientInputCallbacks21handlePointerLocationER14ClientInstanceRK24PointerLocationEventData11FocusImpact",
         (void *)hook_ptr, (void **)&g_orig_ptr);
-    if (g_cfg.hook_hitbox) reg("hitboxes", "_ZNK7Options25getDevRenderBoundingBoxesEv", (void *)hook_hitbox, (void **)&g_orig_hitbox);
+    if (g_cfg.hook_hitbox) {
+        reg("hitboxes option", "_ZNK7Options25getDevRenderBoundingBoxesEv", (void *)hook_hitbox, (void **)&g_orig_hitbox);
+        reg("entity hitbox renderer", "_ZN14EntityRenderer11renderDebugER6EntityR7Options", (void *)hook_entity_debug, (void **)&g_orig_entity_debug);
+    }
     if (g_cfg.hook_perf) {
         reg("fast graphics", "_ZNK7Options16getFancyGraphicsEv", (void *)hook_fancy, (void **)&g_orig_fancy);
         reg("fancy skies", "_ZNK7Options13getFancySkiesEv", (void *)hook_skies, (void **)&g_orig_skies);
