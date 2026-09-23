@@ -355,17 +355,71 @@ static void hit_proj(float *m,float fov,float aspect,float zn,float zf){
     mat_ident(m);float f=1.0f/tanf(fov*0.5f*0.01745329252f);m[0]=f/aspect;m[5]=f;m[10]=(zf+zn)/(zn-zf);m[11]=-1.0f;m[14]=(2.0f*zf*zn)/(zn-zf);m[15]=0.0f;
 }
 static void draw_custom_hitboxes(int w,int h){
-    if(!g_cfg.hitbox_on||g_hit_count<=0||w<=0||h<=0||!hit_init_gl())return;
-    static float verts[4096*3];int n=0;
-    for(int i=0;i<g_hit_count;i++){const NcHitEntity&e=g_hit_entities[i];hit_box(verts,&n,e.x,e.y,e.z,0.30f,1.80f);hit_head(verts,&n,e.x,e.y,e.z,e.pitch,e.yaw);}
-    if(!n)return;
-    float view[16],proj[16],mvp[16];hit_view(view,g_hit_cam,g_hit_rot[0],g_hit_rot[1]);hit_proj(proj,clampf(g_live_fov,30.0f,120.0f),(float)w/(float)h,0.05f,512.0f);mat_mult(mvp,proj,view);
-    GLint old_prog=0,old_vbo=0,old_depth_func=GL_LEQUAL;GLboolean old_depth=glIsEnabled(GL_DEPTH_TEST),old_blend=glIsEnabled(GL_BLEND),old_cull=glIsEnabled(GL_CULL_FACE),old_scissor=glIsEnabled(GL_SCISSOR_TEST),old_depth_mask=GL_TRUE;
-    glGetIntegerv(GL_CURRENT_PROGRAM,&old_prog);glGetIntegerv(GL_ARRAY_BUFFER_BINDING,&old_vbo);glGetIntegerv(GL_DEPTH_FUNC,&old_depth_func);glGetBooleanv(GL_DEPTH_WRITEMASK,&old_depth_mask);
-    glUseProgram(g_hit_prog);glUniformMatrix4fv(g_hit_mvp,1,GL_FALSE,mvp);glBindBuffer(GL_ARRAY_BUFFER,g_hit_vbo);glBufferData(GL_ARRAY_BUFFER,(GLsizeiptr)(n*3*(int)sizeof(float)),verts,GL_STREAM_DRAW);glEnableVertexAttribArray(0);glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,3*(GLsizei)sizeof(float),(const void*)0);
-    glEnable(GL_DEPTH_TEST);glDepthFunc(GL_LEQUAL);glDepthMask(GL_FALSE);glDisable(GL_BLEND);glDisable(GL_CULL_FACE);glDisable(GL_SCISSOR_TEST);
-    for(int i=0;i<g_hit_count;i++){glUniform4f(g_hit_col,0.20f,0.65f,1.0f,1.0f);glDrawArrays(GL_LINES,i*26,24);glUniform4f(g_hit_col,1.0f,0.18f,0.18f,1.0f);glDrawArrays(GL_LINES,i*26+24,2);}
-    glDisableVertexAttribArray(0);glBindBuffer(GL_ARRAY_BUFFER,(GLuint)old_vbo);glUseProgram((GLuint)old_prog);glDepthFunc((GLenum)old_depth_func);glDepthMask(old_depth_mask);if(old_depth)glEnable(GL_DEPTH_TEST);else glDisable(GL_DEPTH_TEST);if(old_blend)glEnable(GL_BLEND);else glDisable(GL_BLEND);if(old_cull)glEnable(GL_CULL_FACE);else glDisable(GL_CULL_FACE);if(old_scissor)glEnable(GL_SCISSOR_TEST);else glDisable(GL_SCISSOR_TEST);
+    if(!g_cfg.hitbox_on||g_hit_count<=0||w<=0||h<=0) return;
+    if(!hit_init_gl()) return;
+
+    /* The previous version changed several unrelated GL states (blend, cull,
+     * scissor, etc.).  On 1.1.5 that state is still needed by the game's/UI
+     * renderer, which is why enabling hitboxes could make the whole frame turn
+     * black/transparent.  Keep this pass deliberately tiny: only touch the
+     * program, VBO/attribute 0, and depth state, and restore every value. */
+    GLint depth_bits = 0;
+    glGetIntegerv(GL_DEPTH_BITS, &depth_bits);
+    if(depth_bits <= 0) {
+        if(!g_gl_err_logged) nclog("custom hitboxes: no depth buffer on current surface");
+        return;
+    }
+
+    static float verts[4096*3];
+    int n=0;
+    for(int i=0;i<g_hit_count;i++){
+        const NcHitEntity &e=g_hit_entities[i];
+        hit_box(verts,&n,e.x,e.y,e.z,0.30f,1.80f);
+        hit_head(verts,&n,e.x,e.y,e.z,e.pitch,e.yaw);
+    }
+    if(!n) return;
+
+    float view[16],proj[16],mvp[16];
+    hit_view(view,g_hit_cam,g_hit_rot[0],g_hit_rot[1]);
+    hit_proj(proj,clampf(g_live_fov,30.0f,120.0f),(float)w/(float)h,0.05f,512.0f);
+    mat_mult(mvp,proj,view);
+
+    GLint old_prog=0, old_vbo=0, old_depth_func=GL_LEQUAL;
+    GLboolean old_depth=glIsEnabled(GL_DEPTH_TEST);
+    GLboolean old_depth_mask=GL_TRUE;
+    GLboolean old_attr0=glIsEnabledVertexAttribArray(0);
+    glGetIntegerv(GL_CURRENT_PROGRAM,&old_prog);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING,&old_vbo);
+    glGetIntegerv(GL_DEPTH_FUNC,&old_depth_func);
+    glGetBooleanv(GL_DEPTH_WRITEMASK,&old_depth_mask);
+
+    glUseProgram(g_hit_prog);
+    glUniformMatrix4fv(g_hit_mvp,1,GL_FALSE,mvp);
+    glBindBuffer(GL_ARRAY_BUFFER,g_hit_vbo);
+    glBufferData(GL_ARRAY_BUFFER,(GLsizeiptr)(n*3*(int)sizeof(float)),verts,GL_STREAM_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,3*(GLsizei)sizeof(float),(const void*)0);
+
+    /* Depth-test the lines so blocks can occlude them, but never write depth. */
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_FALSE);
+
+    for(int i=0;i<g_hit_count;i++){
+        glUniform4f(g_hit_col,0.20f,0.65f,1.0f,1.0f);
+        glDrawArrays(GL_LINES,i*26,24);
+        glUniform4f(g_hit_col,1.0f,0.18f,0.18f,1.0f);
+        glDrawArrays(GL_LINES,i*26+24,2);
+    }
+
+    if(old_attr0) glEnableVertexAttribArray(0);
+    else          glDisableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER,(GLuint)old_vbo);
+    glUseProgram((GLuint)old_prog);
+    glDepthFunc((GLenum)old_depth_func);
+    glDepthMask(old_depth_mask);
+    if(old_depth) glEnable(GL_DEPTH_TEST);
+    else          glDisable(GL_DEPTH_TEST);
 }
 static void hook_entity_render(void *self,void *entity,const void *pos,float yaw,float dt){
     if(g_cfg.hitbox_on&&self&&entity&&pos){
