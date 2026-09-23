@@ -790,25 +790,25 @@ static int menu_font_mult(float h) {
 /* ------------------------------------------------------------------ HUD elements */
 enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_SPEED, E_ELYTRA_ANGLE, E_ZOOM, E_PERSP, E_DROP, E_N, E_COUNT };
 
-static float fpx(int size) { return 8.0f * (float)size; }
-static ImVec2 txt(const char *s, int size) { return ImGui::GetFont()->CalcTextSizeA(fpx(size), FLT_MAX, 0.0f, s); }
-static void put_text(ImDrawList *dl, ImVec2 p, int size, ImU32 col, const char *s) {
+static float fpx(float size) { return 8.0f * (float)size; }
+static ImVec2 txt(const char *s, float size) { return ImGui::GetFont()->CalcTextSizeA(fpx(size), FLT_MAX, 0.0f, s); }
+static void put_text(ImDrawList *dl, ImVec2 p, float size, ImU32 col, const char *s) {
     dl->AddText(ImGui::GetFont(), fpx(size), V(floorf(p.x), floorf(p.y)), col, s);
 }
-static void put_text_sh(ImDrawList *dl, ImVec2 p, int size, ImU32 col, const char *s, bool shadow) {
+static void put_text_sh(ImDrawList *dl, ImVec2 p, float size, ImU32 col, const char *s, bool shadow) {
     if (shadow) put_text(dl, V(p.x + size, p.y + size), size, IM_COL32(0, 0, 0, (int)(((col >> 24) & 0xff) * 0.6f)), s);
     put_text(dl, p, size, col, s);
 }
-static int icon_k(int s) { int k = (int)(s / 1.5f + 0.5f); return k < 1 ? 1 : k; }   /* whole-number icon scale */
+static float icon_k(float s) { int k = (int)(s / 1.5f + 0.5f); return k < 1 ? 1 : k; }   /* whole-number icon scale */
 static bool draw_icon(ImDrawList *dl, int idx, ImVec2 p, float side, ImU32 tint) {
     if (idx < 0 || idx >= NC_ICON_COUNT || !g_icon_tex[idx]) return false;
     dl->AddImage((ImTextureID)(uintptr_t)g_icon_tex[idx], p, V(p.x + side, p.y + side), V(0, 0), V(1, 1), tint);
     return true;
 }
-static void box(ImDrawList *dl, ImVec2 p, ImVec2 s, float alpha, int size) {
+static void box(ImDrawList *dl, ImVec2 p, ImVec2 s, float alpha, float size) {
     dl->AddRectFilled(p, vadd(p, s), rgba(8, 8, 14, 0.75f * alpha), 2.0f * size);
 }
-static float btn_side(int level) { return floorf(g_h * 0.035f * (float)level); }
+static float btn_side(float level) { return floorf(g_h * 0.035f * (float)level); }
 static ImVec2 place(float fx, float fy, ImVec2 sz) { return V(floorf(fx * (g_w - sz.x)), floorf(fy * (g_h - sz.y))); }
 
 /* ---- FPS ---- */
@@ -820,7 +820,7 @@ static ImVec2 size_fps() {
 static void draw_fps(ImDrawList *dl, ImVec2 p, float fps) {
     char b[24]; snprintf(b, sizeof b, "FPS: %d", (int)(fps + 0.5f));
     ImVec2 s = size_fps(); float pad = 2.0f * g_cfg.fps_size;
-    if (g_cfg.fps_bg) box(dl, p, s, g_cfg.fps_alpha, g_cfg.fps_size);
+    if (g_cfg.fps_bg) box(dl, p, s, g_cfg.fps_bg_alpha, (int)g_cfg.fps_size);
     put_text(dl, V(p.x + pad, p.y + pad), g_cfg.fps_size, rgba(235, 235, 245, g_cfg.fps_alpha), b);
 }
 
@@ -847,7 +847,7 @@ static void armor_rows(ArmorRow rows[4], bool preview) {
     }
 }
 static void armor_metrics(ImVec2 *row, ImVec2 *total) {
-    int s = g_cfg.armor_size;
+    float s = g_cfg.armor_size;
     float icon = 16.0f * icon_k(s), gap = 2.0f * s;
     float tw = g_cfg.armor_num == 1 ? txt("999/999", s).x : (g_cfg.armor_num == 2 ? txt("100%", s).x : 0.0f);
     row->x = icon + (tw > 0 ? gap + tw : 0.0f);
@@ -861,9 +861,9 @@ static ImVec2 size_armor() { ImVec2 r, t; armor_metrics(&r, &t); return t; }
 static void draw_armor(ImDrawList *dl, ImVec2 p, bool preview) {
     ArmorRow rows[4]; armor_rows(rows, preview);
     ImVec2 rs, total; armor_metrics(&rs, &total);
-    int s = g_cfg.armor_size; float a = g_cfg.armor_alpha, pad = 2.0f * s, gap = 2.0f * s, icon = 16.0f * icon_k(s);
+    float s = g_cfg.armor_size; float a = g_cfg.armor_alpha, pad = 2.0f * s, gap = 2.0f * s, icon = 16.0f * icon_k(s);
     static const char *letters[4] = { "H", "C", "L", "B" };
-    if (g_cfg.armor_bg) box(dl, p, total, a, s);
+    if (g_cfg.armor_bg) box(dl, p, total, g_cfg.armor_bg_alpha, (int)s);
     int shown = 0;
     for (int i = 0; i < 4; i++) {
         if (!rows[i].present) continue;
@@ -885,7 +885,7 @@ static void draw_armor(ImDrawList *dl, ImVec2 p, bool preview) {
         }
         if (g_cfg.armor_bar) {
             float by = q.y + icon + s;
-            dl->AddRectFilled(V(q.x, by), V(q.x + rs.x, by + 2.0f * s), rgba(40, 40, 55, a));
+            dl->AddRectFilled(V(q.x, by), V(q.x + rs.x, by + 2.0f * s), rgba(40, 40, 55, g_cfg.armor_bg_alpha));
             int rr, gg;                                   /* green -> yellow -> red as it wears out */
             if (frac > 0.5f) { float t = (frac - 0.5f) * 2.0f; rr = (int)(235.0f - 145.0f * t); gg = (int)(215.0f + 15.0f * t); }
             else             { float t = frac * 2.0f;          rr = 235;                        gg = (int)(70.0f + 145.0f * t); }
@@ -897,20 +897,20 @@ static void draw_armor(ImDrawList *dl, ImVec2 p, bool preview) {
 
 /* ---- Elytra indicator (outline icon, text, or both) ---- */
 static ImVec2 size_elytra() {
-    int s = g_cfg.elytra_size; float pad = 2.0f * s, icon = 16.0f * icon_k(s);
+    float s = g_cfg.elytra_size; float pad = 2.0f * s, icon = 16.0f * icon_k(s);
     ImVec2 t = txt("ELYTRA", s);
     if (g_cfg.elytra_style == 0) return V(icon + 2 * pad, icon + 2 * pad);
     if (g_cfg.elytra_style == 1) return V(t.x + 2 * pad, t.y + 2 * pad);
     return V(icon + 2 * s + t.x + 2 * pad, (icon > t.y ? icon : t.y) + 2 * pad);
 }
 static void draw_elytra(ImDrawList *dl, ImVec2 p) {
-    int s = g_cfg.elytra_size; float a = g_cfg.elytra_alpha, pad = 2.0f * s, icon = 16.0f * icon_k(s);
+    float s = g_cfg.elytra_size; float a = g_cfg.elytra_alpha, pad = 2.0f * s, icon = 16.0f * icon_k(s);
     ImVec2 sz = size_elytra();
     ImU32 col = packed(g_cfg.elytra_col, a);
-    if (g_cfg.elytra_style != 0) box(dl, p, sz, a, s);
+    if (g_cfg.elytra_style != 0) box(dl, p, sz, g_cfg.elytra_bg_alpha, (int)s);
     float tx = p.x + pad;
     if (g_cfg.elytra_style != 1) {
-        draw_icon(dl, NC_ICON_ELYTRA_OUTLINE, V(p.x + pad, p.y + (sz.y - icon) * 0.5f), icon, col);
+        draw_icon(dl, NC_ICON_ELYTRA_OUTLINE, V(p.x + pad, p.y + (sz.y - icon) * 0.5f), icon, rgba((g_cfg.elytra_col >> 16) & 0xff, (g_cfg.elytra_col >> 8) & 0xff, g_cfg.elytra_col & 0xff, a));
         tx += icon + 2.0f * s;
     }
     if (g_cfg.elytra_style != 0) put_text(dl, V(tx, p.y + (sz.y - fpx(s)) * 0.5f), s, col, "ELYTRA");
@@ -918,14 +918,14 @@ static void draw_elytra(ImDrawList *dl, ImVec2 p) {
 
 /* ---- Arrow HUD: bow icon + total arrows in your inventory ---- */
 static ImVec2 size_arrow() {
-    int s = g_cfg.arrow_size; float pad = 2.0f * s, icon = 16.0f * icon_k(s);
+    float s = g_cfg.arrow_size; float pad = 2.0f * s, icon = 16.0f * icon_k(s);
     ImVec2 t = txt("999", s);
     return V(icon + 2.0f * s + t.x + 2 * pad, (icon > t.y ? icon : t.y) + 2 * pad);
 }
 static void draw_arrow(ImDrawList *dl, ImVec2 p, int count) {
-    int s = g_cfg.arrow_size; float a = g_cfg.arrow_alpha, pad = 2.0f * s, icon = 16.0f * icon_k(s);
+    float s = g_cfg.arrow_size; float a = g_cfg.arrow_alpha, pad = 2.0f * s, icon = 16.0f * icon_k(s);
     ImVec2 sz = size_arrow();
-    if (g_cfg.arrow_bg) box(dl, p, sz, a, s);
+    if (g_cfg.arrow_bg) box(dl, p, sz, g_cfg.arrow_bg_alpha, (int)s);
     draw_icon(dl, NC_ICON_ARROW, V(p.x + pad, p.y + (sz.y - icon) * 0.5f), icon, rgba(255, 255, 255, a));
     char b[8];
     if (count < 0) snprintf(b, sizeof b, "-");
@@ -936,28 +936,28 @@ static void draw_arrow(ImDrawList *dl, ImVec2 p, int count) {
 
 /* ---- Elytra angle: actual Entity rotation X (pitch) from the 1.1.5 game object ---- */
 static ImVec2 size_elytra_angle() {
-    int s = g_cfg.elytra_angle_size; float pad = 2.0f * s;
+    float s = g_cfg.elytra_angle_size; float pad = 2.0f * s;
     ImVec2 t = txt("Angle: -90.0 deg", s);
     return V(t.x + 2.0f * pad, t.y + 2.0f * pad);
 }
 static void draw_elytra_angle(ImDrawList *dl, ImVec2 p) {
-    int s = g_cfg.elytra_angle_size; float a = g_cfg.elytra_angle_alpha, pad = 2.0f * s;
+    float s = g_cfg.elytra_angle_size; float a = g_cfg.elytra_angle_alpha, pad = 2.0f * s;
     ImVec2 sz = size_elytra_angle();
-    if (g_cfg.elytra_angle_bg) box(dl, p, sz, a, s);
+    if (g_cfg.elytra_angle_bg) box(dl, p, sz, g_cfg.elytra_angle_bg_alpha, (int)s);
     char b[32]; snprintf(b, sizeof b, "Angle: %.1f deg", g_snap.elytra_angle);
     put_text_sh(dl, V(p.x + pad, p.y + pad), s, packed(g_cfg.elytra_angle_col, a), b, !g_cfg.elytra_angle_bg);
 }
 
 /* ---- Speed HUD: horizontal blocks per real second ---- */
 static ImVec2 size_speed() {
-    int z = g_cfg.speed_size; float pad = 2.0f * z;
+    float z = g_cfg.speed_size; float pad = 2.0f * z;
     ImVec2 t = txt("Speed: 99.99 B/s", z);
     return V(t.x + 2.0f * pad, t.y + 2.0f * pad);
 }
 static void draw_speed(ImDrawList *dl, ImVec2 p, float bps) {
-    int z = g_cfg.speed_size; float a = g_cfg.speed_alpha, pad = 2.0f * z;
+    float z = g_cfg.speed_size; float a = g_cfg.speed_alpha, pad = 2.0f * z;
     ImVec2 sz = size_speed();
-    if (g_cfg.speed_bg) box(dl, p, sz, a, z);
+    if (g_cfg.speed_bg) box(dl, p, sz, g_cfg.speed_bg_alpha, (int)z);
     char b[32]; snprintf(b, sizeof b, "Speed: %.2f B/s", bps);
     put_text_sh(dl, V(p.x + pad, p.y + pad), z, packed(g_cfg.speed_col, a), b, !g_cfg.speed_bg);
 }
@@ -969,26 +969,35 @@ static const char *const LBL_N[]     = { "N", "NC", "NIGHT" };
 static const char *const LBL_DROP[]  = { "Q", "DROP", "V" };
 #define NC_COUNT_OF(a) ((int)(sizeof(a) / sizeof((a)[0])))
 static const char *pick(const char *const *list, int n, int idx) { return list[(idx < 0 || idx >= n) ? 0 : idx]; }
+static const char *button_text(int e) {
+    switch (e) {
+        case E_ZOOM: return g_cfg.zoom_text;
+        case E_PERSP: return g_cfg.persp_text;
+        case E_DROP: return g_cfg.drop_text;
+        default: return g_cfg.n_text;
+    }
+}
+
 static int label_level(float side) { int lv = (int)floorf(side / 8.0f * 0.5f); return lv < 1 ? 1 : lv; }
-static ImVec2 btn_size(const char *label, int level) {
+static ImVec2 btn_size(const char *label, float level) {
     float side = btn_side(level), w = side;
     if (strlen(label) > 1) { float need = txt(label, label_level(side)).x + side * 0.6f; if (need > w) w = need; }
     return V(floorf(w), side);
 }
-static void draw_button(ImDrawList *dl, ImVec2 p, ImVec2 sz, const char *label, float alpha, bool round, bool active, int base_col) {
+static void draw_button(ImDrawList *dl, ImVec2 p, ImVec2 sz, const char *label, float bg_alpha, float text_alpha, bool round, bool active, int base_col) {
     ImU32 bg = active ? rgba((int)clampf(((base_col >> 16) & 0xff) * 1.5f, 0, 255), (int)clampf(((base_col >> 8) & 0xff) * 1.5f, 0, 255),
-                             (int)clampf((base_col & 0xff) * 1.5f, 0, 255), alpha)
-                      : packed(base_col, alpha);
+                             (int)clampf((base_col & 0xff) * 1.5f, 0, 255), bg_alpha)
+                      : packed(base_col, bg_alpha);
     ImVec2 c = V(p.x + sz.x * 0.5f, p.y + sz.y * 0.5f);
     if (round && strlen(label) == 1) dl->AddCircleFilled(c, sz.y * 0.5f, bg);
     else                             dl->AddRectFilled(p, V(p.x + sz.x, p.y + sz.y), bg, sz.y * 0.18f);
     int lv = label_level(sz.y);
     ImVec2 t = txt(label, lv);
-    put_text(dl, V(c.x - t.x * 0.5f, c.y - t.y * 0.5f), lv, rgba(240, 240, 250, alpha), label);
+    put_text(dl, V(c.x - t.x * 0.5f, c.y - t.y * 0.5f), lv, rgba(240, 240, 250, text_alpha), label);
 }
 
 /* draws one button in its own click window; returns true when it was tapped */
-static bool button_at(const char *id, ImVec2 p, ImVec2 sz, const char *label, float alpha, bool round,
+static bool button_at(const char *id, ImVec2 p, ImVec2 sz, const char *label, float bg_alpha, float text_alpha, bool round,
                       bool active_look, int base_col, NcRect *rect) {
     ImGui::SetNextWindowPos(p);
     ImGui::SetNextWindowSize(sz);
@@ -1000,7 +1009,7 @@ static bool button_at(const char *id, ImVec2 p, ImVec2 sz, const char *label, fl
     ImGui::SetCursorScreenPos(p);
     bool pressed = ImGui::InvisibleButton("##b", sz);
     bool active = ImGui::IsItemActive();
-    draw_button(ImGui::GetWindowDrawList(), p, sz, label, alpha, round, active || active_look, base_col);
+    draw_button(ImGui::GetWindowDrawList(), p, sz, label, bg_alpha, text_alpha, round, active || active_look, base_col);
     ImGui::End();
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
@@ -1032,10 +1041,10 @@ static ImVec2 elem_size(int e) {
         case E_ARROW: return size_arrow();
         case E_SPEED: return size_speed();
         case E_ELYTRA_ANGLE: return size_elytra_angle();
-        case E_DROP:  return btn_size(pick(LBL_DROP,  NC_COUNT_OF(LBL_DROP),  g_cfg.drop_label),  g_cfg.drop_btn);
-        case E_ZOOM:  return btn_size(pick(LBL_ZOOM,  NC_COUNT_OF(LBL_ZOOM),  g_cfg.zoom_label),  g_cfg.zoom_btn);
-        case E_PERSP: return btn_size(pick(LBL_PERSP, NC_COUNT_OF(LBL_PERSP), g_cfg.persp_label), g_cfg.persp_btn);
-        default:      return btn_size(pick(LBL_N,     NC_COUNT_OF(LBL_N),     g_cfg.n_label),     g_cfg.n_btn);
+        case E_DROP:  return btn_size(g_cfg.drop_text,  g_cfg.drop_btn);
+        case E_ZOOM:  return btn_size(g_cfg.zoom_text,  g_cfg.zoom_btn);
+        case E_PERSP: return btn_size(g_cfg.persp_text, g_cfg.persp_btn);
+        default:      return btn_size(g_cfg.n_text,     g_cfg.n_btn);
     }
 }
 
@@ -1065,10 +1074,10 @@ static void build_edit(float w, float h) {
             case E_ARROW:  draw_arrow(dl, pos, g_snap.arrow_count < 0 ? -1 : g_snap.arrow_count); break;
             case E_SPEED:  draw_speed(dl, pos, 4.20f); break;
             case E_ELYTRA_ANGLE: draw_elytra_angle(dl, pos); break;
-            case E_DROP:   draw_button(dl, pos, sz, pick(LBL_DROP,  NC_COUNT_OF(LBL_DROP),  g_cfg.drop_label),  1.0f, false, false, g_cfg.drop_col); break;
-            case E_ZOOM:   draw_button(dl, pos, sz, pick(LBL_ZOOM,  NC_COUNT_OF(LBL_ZOOM),  g_cfg.zoom_label),  1.0f, false, false, g_cfg.zoom_col); break;
-            case E_PERSP:  draw_button(dl, pos, sz, pick(LBL_PERSP, NC_COUNT_OF(LBL_PERSP), g_cfg.persp_label), 1.0f, false, false, g_cfg.persp_col); break;
-            default:       draw_button(dl, pos, sz, pick(LBL_N,     NC_COUNT_OF(LBL_N),     g_cfg.n_label),     1.0f, true,  false, 0x38306E); break;
+            case E_DROP:   draw_button(dl, pos, sz, g_cfg.drop_text,  1.0f, g_cfg.drop_text_alpha, false, false, g_cfg.drop_col); break;
+            case E_ZOOM:   draw_button(dl, pos, sz, g_cfg.zoom_text,  1.0f, g_cfg.zoom_text_alpha, false, false, g_cfg.zoom_col); break;
+            case E_PERSP:  draw_button(dl, pos, sz, g_cfg.persp_text, 1.0f, g_cfg.persp_text_alpha, false, false, g_cfg.persp_col); break;
+            default:       draw_button(dl, pos, sz, g_cfg.n_text,     1.0f, g_cfg.n_text_alpha, true,  false, 0x38306E); break;
         }
         dl->AddRect(pos, vadd(pos, sz), IM_COL32(150, 130, 255, 255), 3.0f, 0, 2.0f);
         ImGui::SetCursorScreenPos(pos);
@@ -1110,13 +1119,15 @@ static void head(const char *title, int *on, const char *desc) {
     if (desc) ImGui::TextDisabled("%s", desc);
     ImGui::Separator();
 }
-static void label_btn(const char *const *list, int n, int *idx) {
-    char b[64]; snprintf(b, sizeof b, "Button text: %s  (tap to change)", pick(list, n, *idx));
-    if (ImGui::Button(b)) *idx = (*idx + 1) % n;
+static void button_text_edit(const char *label, char *text) {
+    char id[48];
+    snprintf(id, sizeof id, "%s##btntext", label);
+    ImGui::InputText(id, text, 17, ImGuiInputTextFlags_CharsNoBlank);
 }
-static void hud_look(int *size, float *alpha) {
-    sl_i("Size", size, 1, 8);
-    sl_f("Opacity", alpha, 0.1f, 1.0f);
+static void hud_look(float *size, float *alpha, float *bg_alpha) {
+    sl_f("Size", size, 1.0f, 8.0f);
+    sl_f("Text / icon opacity", alpha, 0.05f, 1.0f);
+    sl_f("Background opacity", bg_alpha, 0.0f, 1.0f);
 }
 static void hud_pos(float *x, float *y) {
     move_btn();
@@ -1132,7 +1143,7 @@ static void panel_fps() {
     head("FPS counter", &g_cfg.fps_on, "Shows your frame rate.");
     chk("Also show in menus (outside a world)", &g_cfg.fps_menus);
     chk("Dark background", &g_cfg.fps_bg);
-    hud_look(&g_cfg.fps_size, &g_cfg.fps_alpha);
+    hud_look(&g_cfg.fps_size, &g_cfg.fps_alpha, &g_cfg.fps_bg_alpha);
     hud_pos(&g_cfg.fps_x, &g_cfg.fps_y);
 }
 static void panel_armor() {
@@ -1146,7 +1157,7 @@ static void panel_armor() {
     if (ImGui::RadioButton("Durability", g_cfg.armor_num == 1)) g_cfg.armor_num = 1;
     ImGui::SameLine();
     if (ImGui::RadioButton("Percent", g_cfg.armor_num == 2)) g_cfg.armor_num = 2;
-    hud_look(&g_cfg.armor_size, &g_cfg.armor_alpha);
+    hud_look(&g_cfg.armor_size, &g_cfg.armor_alpha, &g_cfg.armor_bg_alpha);
     hud_pos(&g_cfg.armor_x, &g_cfg.armor_y);
 }
 static void panel_elytra() {
@@ -1157,28 +1168,28 @@ static void panel_elytra() {
     ImGui::SameLine();
     if (ImGui::RadioButton("Both", g_cfg.elytra_style == 2)) g_cfg.elytra_style = 2;
     color_picker("Color", &g_cfg.elytra_col);
-    hud_look(&g_cfg.elytra_size, &g_cfg.elytra_alpha);
+    hud_look(&g_cfg.elytra_size, &g_cfg.elytra_alpha, &g_cfg.elytra_bg_alpha);
     hud_pos(&g_cfg.elytra_x, &g_cfg.elytra_y);
 }
 static void panel_arrow() {
     head("Arrow HUD", &g_cfg.arrow_on, "Shows while you hold a bow, with the total arrows in your inventory.");
     chk("Dark background", &g_cfg.arrow_bg);
     color_picker("Number color", &g_cfg.arrow_col);
-    hud_look(&g_cfg.arrow_size, &g_cfg.arrow_alpha);
+    hud_look(&g_cfg.arrow_size, &g_cfg.arrow_alpha, &g_cfg.arrow_bg_alpha);
     hud_pos(&g_cfg.arrow_x, &g_cfg.arrow_y);
 }
 static void panel_speed() {
     head("Speed indicator", &g_cfg.speed_on, "Shows your real horizontal movement speed in blocks per second.");
     chk("Dark background", &g_cfg.speed_bg);
     color_picker("Text color", &g_cfg.speed_col);
-    hud_look(&g_cfg.speed_size, &g_cfg.speed_alpha);
+    hud_look(&g_cfg.speed_size, &g_cfg.speed_alpha, &g_cfg.speed_bg_alpha);
     hud_pos(&g_cfg.speed_x, &g_cfg.speed_y);
 }
 static void panel_elytra_angle() {
     head("Elytra angle", &g_cfg.elytra_angle_on, "Shows your actual flight pitch while gliding.");
     chk("Dark background", &g_cfg.elytra_angle_bg);
     color_picker("Text color", &g_cfg.elytra_angle_col);
-    hud_look(&g_cfg.elytra_angle_size, &g_cfg.elytra_angle_alpha);
+    hud_look(&g_cfg.elytra_angle_size, &g_cfg.elytra_angle_alpha, &g_cfg.elytra_angle_bg_alpha);
     hud_pos(&g_cfg.elytra_angle_x, &g_cfg.elytra_angle_y);
 }
 static void panel_nohurt() {
@@ -1187,20 +1198,22 @@ static void panel_nohurt() {
 static void panel_zoom() {
     head("Zoom", &g_cfg.zoom_on, "A Z button in the world. Tap it to zoom in, tap again to zoom out.");
     sl_f("Zoom level", &g_cfg.zoom_level, 1.5f, 12.0f);
-    label_btn(LBL_ZOOM, NC_COUNT_OF(LBL_ZOOM), &g_cfg.zoom_label);
+    button_text_edit("Button text", g_cfg.zoom_text);
     color_picker("Button color", &g_cfg.zoom_col);
     chk("Also show on the pause screen", &g_cfg.zoom_pause);
-    sl_i("Button size", &g_cfg.zoom_btn, 1, 8);
-    sl_f("Button opacity", &g_cfg.zoom_alpha, 0.1f, 1.0f);
+    sl_f("Button size", &g_cfg.zoom_btn, 1.0f, 8.0f);
+    sl_f("Background opacity", &g_cfg.zoom_alpha, 0.0f, 1.0f);
+    sl_f("Text opacity", &g_cfg.zoom_text_alpha, 0.0f, 1.0f);
     hud_pos(&g_cfg.zoom_x, &g_cfg.zoom_y);
 }
 static void panel_persp() {
     head("Perspective button", &g_cfg.persp_on, "A button in the world that switches first/third person.");
-    label_btn(LBL_PERSP, NC_COUNT_OF(LBL_PERSP), &g_cfg.persp_label);
+    button_text_edit("Button text", g_cfg.persp_text);
     color_picker("Button color", &g_cfg.persp_col);
     chk("Also show on the pause screen", &g_cfg.persp_pause);
-    sl_i("Button size", &g_cfg.persp_btn, 1, 8);
-    sl_f("Button opacity", &g_cfg.persp_alpha, 0.1f, 1.0f);
+    sl_f("Button size", &g_cfg.persp_btn, 1.0f, 8.0f);
+    sl_f("Background opacity", &g_cfg.persp_alpha, 0.0f, 1.0f);
+    sl_f("Text opacity", &g_cfg.persp_text_alpha, 0.0f, 1.0f);
     hud_pos(&g_cfg.persp_x, &g_cfg.persp_y);
     ImGui::TextDisabled("Works after you have touched the screen in a world once.");
 }
@@ -1223,20 +1236,22 @@ static void panel_perf() {
 }
 static void panel_drop() {
     head("Quick drop", &g_cfg.drop_on, "A button that drops the item you're holding, one tap.");
-    label_btn(LBL_DROP, NC_COUNT_OF(LBL_DROP), &g_cfg.drop_label);
+    button_text_edit("Button text", g_cfg.drop_text);
     color_picker("Button color", &g_cfg.drop_col);
     chk("Also show on the pause screen", &g_cfg.drop_pause);
-    sl_i("Button size", &g_cfg.drop_btn, 1, 8);
-    sl_f("Button opacity", &g_cfg.drop_alpha, 0.1f, 1.0f);
+    sl_f("Button size", &g_cfg.drop_btn, 1.0f, 8.0f);
+    sl_f("Background opacity", &g_cfg.drop_alpha, 0.0f, 1.0f);
+    sl_f("Text opacity", &g_cfg.drop_text_alpha, 0.0f, 1.0f);
     hud_pos(&g_cfg.drop_x, &g_cfg.drop_y);
     ImGui::TextDisabled("Works after you have touched the screen in a world once.");
 }
 static void panel_client() {
     head("Client", 0, "Menu and N button.");
     sl_i("Menu text size (0 = auto)", &g_cfg.ui_font, 0, 6);
-    label_btn(LBL_N, NC_COUNT_OF(LBL_N), &g_cfg.n_label);
-    sl_i("N button size", &g_cfg.n_btn, 1, 8);
-    sl_f("N button opacity", &g_cfg.n_alpha, 0.2f, 1.0f);
+    button_text_edit("N button text", g_cfg.n_text);
+    sl_f("N button size", &g_cfg.n_btn, 1.0f, 8.0f);
+    sl_f("Background opacity", &g_cfg.n_alpha, 0.0f, 1.0f);
+    sl_f("Text opacity", &g_cfg.n_text_alpha, 0.0f, 1.0f);
     ImGui::TextDisabled("The N button shows on the Settings screen and the pause menu.");
     move_btn();
     ImGui::TextDisabled("N button position");
@@ -1428,26 +1443,26 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
 
         if (zoom_vis) {
             ImVec2 sz = elem_size(E_ZOOM);
-            if (button_at("##night_zoom", place(g_cfg.zoom_x, g_cfg.zoom_y, sz), sz, pick(LBL_ZOOM, NC_COUNT_OF(LBL_ZOOM), g_cfg.zoom_label),
-                          g_cfg.zoom_alpha, false, g_zoom_active != 0, g_cfg.zoom_col, &hud[0]))
+            if (button_at("##night_zoom", place(g_cfg.zoom_x, g_cfg.zoom_y, sz), sz, g_cfg.zoom_text,
+                          g_cfg.zoom_alpha, g_cfg.zoom_text_alpha, false, g_zoom_active != 0, g_cfg.zoom_col, &hud[0]))
                 g_zoom_active = g_zoom_active ? 0 : 1;
         }
         if (persp_vis) {
             ImVec2 sz = elem_size(E_PERSP);
-            if (button_at("##night_persp", place(g_cfg.persp_x, g_cfg.persp_y, sz), sz, pick(LBL_PERSP, NC_COUNT_OF(LBL_PERSP), g_cfg.persp_label),
-                          g_cfg.persp_alpha, false, false, g_cfg.persp_col, &hud[1]))
+            if (button_at("##night_persp", place(g_cfg.persp_x, g_cfg.persp_y, sz), sz, g_cfg.persp_text,
+                          g_cfg.persp_alpha, g_cfg.persp_text_alpha, false, false, g_cfg.persp_col, &hud[1]))
                 do_perspective();
         }
         if (drop_vis) {
             ImVec2 sz = elem_size(E_DROP);
-            if (button_at("##night_drop", place(g_cfg.drop_x, g_cfg.drop_y, sz), sz, pick(LBL_DROP, NC_COUNT_OF(LBL_DROP), g_cfg.drop_label),
-                          g_cfg.drop_alpha, false, false, g_cfg.drop_col, &hud[2]))
+            if (button_at("##night_drop", place(g_cfg.drop_x, g_cfg.drop_y, sz), sz, g_cfg.drop_text,
+                          g_cfg.drop_alpha, g_cfg.drop_text_alpha, false, false, g_cfg.drop_col, &hud[2]))
                 { if (g_cic && g_ci) cic_drop(g_cic, g_ci); else nclog("drop: game objects not captured yet"); }
         }
         if (menu_reach && !g_menu_open) {
             ImVec2 sz = elem_size(E_N);
-            if (button_at("##night_n", place(g_cfg.n_x, g_cfg.n_y, sz), sz, pick(LBL_N, NC_COUNT_OF(LBL_N), g_cfg.n_label),
-                          g_cfg.n_alpha, true, false, 0x38306E, &nrect)) {
+            if (button_at("##night_n", place(g_cfg.n_x, g_cfg.n_y, sz), sz, g_cfg.n_text,
+                          g_cfg.n_alpha, g_cfg.n_text_alpha, true, false, 0x38306E, &nrect)) {
                 g_menu_open = true; nclog("menu opened");
             }
         }
