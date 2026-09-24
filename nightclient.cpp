@@ -113,7 +113,6 @@ static bool  g_drawing_logged = false, g_gl_err_logged = false;
 static GLuint g_icon_tex[NC_ICON_COUNT];
 static JavaVM *g_jvm = 0;
 static jobject g_kb_activity = 0;
-static jobject g_kb_edit = 0;
 static bool g_kb_open = false;
 static int g_kb_target = 0; /* 1 zoom, 2 perspective, 3 drop, 4 N */
 static char *g_kb_text = 0;
@@ -150,111 +149,78 @@ static void kb_release(JNIEnv *env, bool attached) { if (attached && g_jvm) g_jv
  * if the old MCPE build exposes no Java VM/activity, the text field still works as an
  * ImGui field but no soft keyboard is requested. */
 static jobject kb_find_activity(JNIEnv *env) {
-    jclass at = env->FindClass("android/app/ActivityThread");
-    if (!at) return 0;
-    jmethodID cur = env->GetStaticMethodID(at, "currentActivityThread", "()Landroid/app/ActivityThread;");
-    if (!cur) { env->DeleteLocalRef(at); return 0; }
-    jobject thread = env->CallStaticObjectMethod(at, cur);
-    if (!thread) { env->DeleteLocalRef(at); return 0; }
-    jfieldID af = env->GetFieldID(at, "mActivities", "Landroid/util/ArrayMap;");
-    if (!af) { env->DeleteLocalRef(thread); env->DeleteLocalRef(at); return 0; }
-    jobject map = env->GetObjectField(thread, af);
-    env->DeleteLocalRef(thread); env->DeleteLocalRef(at);
-    if (!map) return 0;
-    jclass mc = env->FindClass("android/util/ArrayMap");
-    if (!mc) { env->DeleteLocalRef(map); return 0; }
-    jmethodID vals = env->GetMethodID(mc, "values", "()Ljava/util/Collection;");
+    /* MCPE 1.1.5 keeps the real MainActivity in a public static singleton.
+     * ActivityThread/mActivities reflection is unreliable on newer Android
+     * releases, which is why the old keyboard bridge could create the ImGui
+     * cursor but never bring up the IME. */
+    jclass mc = env->FindClass("com/mojang/minecraftpe/MainActivity");
+    if (!mc) return 0;
+    jfieldID inst = env->GetStaticFieldID(mc, "mInstance", "Lcom/mojang/minecraftpe/MainActivity;");
+    if (!inst) { env->DeleteLocalRef(mc); return 0; }
+    jobject obj = env->GetStaticObjectField(mc, inst);
+    if (!obj) { env->DeleteLocalRef(mc); return 0; }
+    jobject global = env->NewGlobalRef(obj);
+    env->DeleteLocalRef(obj);
     env->DeleteLocalRef(mc);
-    if (!vals) { env->DeleteLocalRef(map); return 0; }
-    jobject col = env->CallObjectMethod(map, vals);
-    env->DeleteLocalRef(map);
-    if (!col) return 0;
-    jclass cc = env->FindClass("java/util/Collection");
-    jmethodID itid = cc ? env->GetMethodID(cc, "iterator", "()Ljava/util/Iterator;") : 0;
-    if (!itid) { if (cc) env->DeleteLocalRef(cc); env->DeleteLocalRef(col); return 0; }
-    jobject it = env->CallObjectMethod(col, itid);
-    env->DeleteLocalRef(cc);
-    env->DeleteLocalRef(col);
-    if (!it) return 0;
-    jclass ic = env->FindClass("java/util/Iterator");
-    jmethodID has = ic ? env->GetMethodID(ic, "hasNext", "()Z") : 0;
-    jmethodID next = ic ? env->GetMethodID(ic, "next", "()Ljava/lang/Object;") : 0;
-    if (!has || !next) { if (ic) env->DeleteLocalRef(ic); env->DeleteLocalRef(it); return 0; }
-    jobject activity = 0;
-    while (env->CallBooleanMethod(it, has)) {
-        jobject rec = env->CallObjectMethod(it, next);
-        if (!rec) continue;
-        jclass rc = env->GetObjectClass(rec);
-        jfieldID actf = env->GetFieldID(rc, "activity", "Landroid/app/Activity;");
-        if (actf) { activity = env->GetObjectField(rec, actf); env->DeleteLocalRef(rc); env->DeleteLocalRef(rec); break; }
-        env->DeleteLocalRef(rc); env->DeleteLocalRef(rec);
-    }
-    env->DeleteLocalRef(ic); env->DeleteLocalRef(it);
-    return activity;
+    return global;
 }
 
-static bool kb_show(JNIEnv *env) {
-    if (!g_kb_edit) return false;
-    jclass editc = env->FindClass("android/widget/EditText");
-    jclass viewc = env->FindClass("android/view/View");
-    jclass immc = env->FindClass("android/view/inputmethod/InputMethodManager");
-    if (!editc || !viewc || !immc) return false;
-    jmethodID request = env->GetMethodID(viewc, "requestFocus", "()Z");
-    jmethodID ctx = env->GetMethodID(viewc, "getContext", "()Landroid/content/Context;");
-    jmethodID getsvc = env->GetMethodID(env->FindClass("android/content/Context"), "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
-    jfieldID svcfield = env->GetStaticFieldID(env->FindClass("android/content/Context"), "INPUT_METHOD_SERVICE", "Ljava/lang/String;");
-    if (!request || !ctx || !getsvc || !svcfield) return false;
-    env->CallBooleanMethod(g_kb_edit, request);
-    jobject context = env->CallObjectMethod(g_kb_edit, ctx);
-    jstring svcname = (jstring)env->GetStaticObjectField(env->FindClass("android/content/Context"), svcfield);
-    jobject imm = env->CallObjectMethod(context, getsvc, svcname);
-    jmethodID show = env->GetMethodID(immc, "showSoftInput", "(Landroid/view/View;I)Z");
-    jboolean ok = show && imm ? env->CallBooleanMethod(imm, show, g_kb_edit, 0) : JNI_FALSE;
-    if (imm) env->DeleteLocalRef(imm); if (context) env->DeleteLocalRef(context); if (svcname) env->DeleteLocalRef(svcname);
-    return ok == JNI_TRUE;
-}
-
-/* MCPE 1.1.5 already has its own native text-input bridge in MainActivity.
- * Use that instead of creating a second EditText ourselves.  The game's
- * showKeyboard()/getUserInputString()/hideKeyboard() path is designed to be
- * called from native code and takes care of the Android UI-thread/IME work. */
 static bool kb_start(int target, char *text) {
     bool attached = false;
     JNIEnv *env = kb_env(&attached);
     if (!env) return false;
-    if (!g_kb_activity) g_kb_activity = kb_find_activity(env);
-    if (!g_kb_activity) { kb_release(env, attached); return false; }
+
+    if (!g_kb_activity)
+        g_kb_activity = kb_find_activity(env);
+    if (!g_kb_activity) {
+        nclog("keyboard: MainActivity.mInstance unavailable");
+        kb_release(env, attached);
+        return false;
+    }
 
     jclass ac = env->GetObjectClass(g_kb_activity);
-    jmethodID show = env->GetMethodID(ac, "showKeyboard", "(Ljava/lang/String;IZZ)V");
+    jmethodID show = ac ? env->GetMethodID(ac, "showKeyboard", "(Ljava/lang/String;IZZ)V") : 0;
     if (!show) {
+        nclog("keyboard: showKeyboard method unavailable");
         if (ac) env->DeleteLocalRef(ac);
         kb_release(env, attached);
         return false;
     }
 
     jstring js = env->NewStringUTF(text ? text : "");
-    env->CallVoidMethod(g_kb_activity, show, js, JNI_FALSE, JNI_FALSE);
-    if (js) env->DeleteLocalRef(js);
-    bool failed = env->ExceptionCheck();
-    if (failed) env->ExceptionClear();
-    if (ac) env->DeleteLocalRef(ac);
-
     g_kb_target = target;
     g_kb_text = text;
-    g_kb_open = !failed;
+    g_kb_open = false;
+
+    /* MainActivity.showKeyboard() is MCPE's own input bridge.  It creates and
+     * focuses TextInputProxyEditTextbox on the UI thread internally, so do not
+     * create another EditText or call InputMethodManager ourselves. */
+    env->CallVoidMethod(g_kb_activity, show, js, 0, JNI_FALSE, JNI_FALSE);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        nclog("keyboard: showKeyboard threw");
+    } else {
+        g_kb_open = true;
+        nclog("keyboard: showKeyboard requested");
+    }
+
+    if (js) env->DeleteLocalRef(js);
+    if (ac) env->DeleteLocalRef(ac);
     kb_release(env, attached);
     return g_kb_open;
 }
 
 static void kb_poll() {
     if (!g_kb_open || !g_kb_text || !g_kb_activity) return;
+
     bool attached = false;
     JNIEnv *env = kb_env(&attached);
     if (!env) return;
 
     jclass ac = env->GetObjectClass(g_kb_activity);
     jmethodID get = ac ? env->GetMethodID(ac, "getUserInputString", "()[Ljava/lang/String;") : 0;
+    jmethodID status = ac ? env->GetMethodID(ac, "getUserInputStatus", "()I") : 0;
+
     if (get) {
         jobjectArray arr = (jobjectArray)env->CallObjectMethod(g_kb_activity, get);
         if (!env->ExceptionCheck() && arr) {
@@ -276,15 +242,44 @@ static void kb_poll() {
             env->ExceptionClear();
         }
     }
+
+    /* MCPE changes _userInputStatus when the native text box finishes/cancels.
+     * Keep the ImGui field live while it is 0 and close our bridge afterwards. */
+    int st = 0;
+    if (status) {
+        st = env->CallIntMethod(g_kb_activity, status);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); st = 0; }
+    }
+
     if (ac) env->DeleteLocalRef(ac);
     kb_release(env, attached);
+
+    if (st != 0) {
+        /* hideKeyboard is idempotent in the 1.1.5 activity implementation. */
+        bool a2 = false;
+        JNIEnv *e2 = kb_env(&a2);
+        if (e2) {
+            jclass c2 = e2->GetObjectClass(g_kb_activity);
+            jmethodID hide = c2 ? e2->GetMethodID(c2, "hideKeyboard", "()V") : 0;
+            if (hide) e2->CallVoidMethod(g_kb_activity, hide);
+            if (e2->ExceptionCheck()) e2->ExceptionClear();
+            if (c2) e2->DeleteLocalRef(c2);
+            kb_release(e2, a2);
+        }
+        g_kb_open = false;
+        g_kb_target = 0;
+        g_kb_text = 0;
+    }
 }
 
 static void kb_stop() {
     if (!g_kb_open || !g_kb_activity) {
-        g_kb_open = false; g_kb_target = 0; g_kb_text = 0;
+        g_kb_open = false;
+        g_kb_target = 0;
+        g_kb_text = 0;
         return;
     }
+
     bool attached = false;
     JNIEnv *env = kb_env(&attached);
     if (!env) return;
@@ -704,30 +699,17 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
     const NcAabb6 *aw = (const NcAabb6 *)((const unsigned char *)entity + 0x104);
     NcAabb6 b = *aw;
 
-    /* The entity renderer receives interpolated position. The AABB tracks the
-     * actual entity position, so interpolate the box by the same delta. */
-    NcVec3 cur = {0,0,0};
-    NcVec3 interp = {0,0,0};
+    /* Keep the AABB in the same local coordinate space used by the entity
+     * renderer.  Entity::bb is stored in world coordinates; subtract the
+     * entity's current origin, then apply the exact interpolated render_pos
+     * supplied to EntityRenderDispatcher::render().  This avoids the old
+     * interp/camera-offset cancellation that could produce a second, floating
+     * hitbox on moving entities. */
     const float *cp = entity_getPos(entity);
-    if (cp) { cur.x = cp[0]; cur.y = cp[1]; cur.z = cp[2]; }
-    entity_getInterpolatedPosition(&interp, entity, partial);
-    float dx = interp.x - cur.x;
-    float dy = interp.y - cur.y;
-    float dz = interp.z - cur.z;
-    b.minx += dx; b.maxx += dx;
-    b.miny += dy; b.maxy += dy;
-    b.minz += dz; b.maxz += dz;
-
-    /* Convert world AABB to the coordinate system used by the entity render
-     * call: relative to the game's render/player offset.  render_pos =
-     * interpolated world position - dispatcher offset, therefore offset is
-     * interp - render_pos. */
-    float offx = interp.x - render_pos[0];
-    float offy = interp.y - render_pos[1];
-    float offz = interp.z - render_pos[2];
-    b.minx -= offx; b.maxx -= offx;
-    b.miny -= offy; b.maxy -= offy;
-    b.minz -= offz; b.maxz -= offz;
+    if (!cp) return;
+    b.minx -= cp[0]; b.maxx -= cp[0];
+    b.miny -= cp[1]; b.maxy -= cp[1];
+    b.minz -= cp[2]; b.maxz -= cp[2];
 
     NcVec2 rot = {0,0};
     entity_getInterpolatedRotation(&rot, entity, partial);
@@ -742,7 +724,7 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
     float proj[16], view[16], model[16], vm[16], mvp[16];
     hit_copy_matrix(*g_projection_slot, proj);
     hit_copy_matrix(*g_view_slot, view);
-    hit_translate(model, 0.0f, 0.0f, 0.0f);
+    hit_translate(model, render_pos[0], render_pos[1], render_pos[2]);
     hit_mul(vm, view, model);
     hit_mul(mvp, proj, vm);
 
@@ -1129,15 +1111,25 @@ static void draw_arrow(ImDrawList *dl, ImVec2 p, int count) {
 /* ---- Elytra angle: actual Entity rotation X (pitch) from the 1.1.5 game object ---- */
 static ImVec2 size_elytra_angle() {
     float s = g_cfg.elytra_angle_size; float pad = 2.0f * s;
-    ImVec2 t = txt("Angle: -90.0 deg", s);
-    return V(t.x + 2.0f * pad, t.y + 2.0f * pad);
+    ImVec2 t = txt("-90", s);
+    return V(t.x + 2.0f * pad + s * 1.1f, t.y + 2.0f * pad);
 }
 static void draw_elytra_angle(ImDrawList *dl, ImVec2 p) {
     float s = g_cfg.elytra_angle_size; float a = g_cfg.elytra_angle_alpha, pad = 2.0f * s;
     ImVec2 sz = size_elytra_angle();
     if (g_cfg.elytra_angle_bg) box_col(dl, p, sz, g_cfg.elytra_angle_bg_alpha, s, g_cfg.elytra_angle_bg_col);
-    char b[32]; snprintf(b, sizeof b, "%.0f°", g_snap.elytra_angle);
-    put_text_sh(dl, V(p.x + pad, p.y + pad), s, packed(g_cfg.elytra_angle_col, a), b, !g_cfg.elytra_angle_bg);
+
+    char b[32]; snprintf(b, sizeof b, "%.0f", g_snap.elytra_angle);
+    ImVec2 tp = V(p.x + pad, p.y + pad);
+    put_text_sh(dl, tp, s, packed(g_cfg.elytra_angle_col, a), b, !g_cfg.elytra_angle_bg);
+
+    /* nc_font is ASCII-only, so drawing UTF-8 '°' would become '?'.  Draw the
+     * degree mark as a tiny circle instead; visually it is the same glyph and
+     * works on every device/font shipped with Night Client 1.1.5. */
+    ImVec2 tw = txt(b, s);
+    float r = fpx(s) * 0.11f;
+    ImVec2 c = V(tp.x + tw.x + r * 1.45f, tp.y + r * 0.95f);
+    dl->AddCircle(c, r, packed(g_cfg.elytra_angle_col, a), 12, fmaxf(1.0f, s * 0.22f));
 }
 
 /* ---- Speed HUD: horizontal blocks per real second ---- */
