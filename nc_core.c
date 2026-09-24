@@ -40,7 +40,10 @@ int nc_cfg_load(NcConfig *c, const char *path) {
 
         for (int i = 0; i < NC_NFIELDS; i++) {
             if (!strcmp(line, FIELDS[i].key)) {
-                set_field(c, &FIELDS[i], (float)atof(eq + 1));
+                if (FIELDS[i].is_float)
+                    set_field(c, &FIELDS[i], (float)strtod(eq + 1, NULL));
+                else
+                    set_field(c, &FIELDS[i], (float)strtol(eq + 1, NULL, 0));
                 goto loaded_line;
             }
         }
@@ -82,8 +85,13 @@ int nc_cfg_save(const NcConfig *c, const char *path) {
     for (int i = 0; i < NC_NFIELDS; i++) {
         if (FIELDS[i].is_float)
             fprintf(f, "%s=%.4f\n", FIELDS[i].key, *(const float *)((const char *)c + FIELDS[i].off));
-        else
-            fprintf(f, "%s=%d\n", FIELDS[i].key, *(const int *)((const char *)c + FIELDS[i].off));
+        else {
+            int iv = *(const int *)((const char *)c + FIELDS[i].off);
+            if (strstr(FIELDS[i].key, "_col") || strstr(FIELDS[i].key, "_bg_col"))
+                fprintf(f, "%s=0x%06X\n", FIELDS[i].key, iv & 0xFFFFFF);
+            else
+                fprintf(f, "%s=%d\n", FIELDS[i].key, iv);
+        }
     }
 
     fprintf(f, "zoom_text=%s\n", c->zoom_text);

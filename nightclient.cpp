@@ -96,7 +96,7 @@ static volatile double g_play_time = 0;      /* last time the gameplay screen wa
 static volatile double g_tick_time = 0;      /* last time the local player ticked */
 static volatile int    g_zoom_active = 0;
 static float           g_zoom_cur = 1.0f;
-static struct { volatile int gliding; int present[4], id[4], dur[4], max[4]; int holding_bow; float speed_bps; int arrow_count; float elytra_angle; int elytra_angle_valid; } g_snap;
+static struct { volatile int gliding; int present[4], id[4], dur[4], max[4]; int holding_bow; float speed_bps; int arrow_count; float elytra_angle; int elytra_angle_valid; float x, y, z; } g_snap;
 static float g_last_px = 0.0f, g_last_py = 0.0f, g_last_pz = 0.0f;
 static double g_last_pos_time = 0.0;
 static bool g_have_last_pos = false;
@@ -114,6 +114,7 @@ static GLuint g_icon_tex[NC_ICON_COUNT];
 static JavaVM *g_jvm = 0;
 static jobject g_kb_activity = 0;
 static bool g_kb_open = false;
+static int g_kb_status = -1;
 static int g_kb_target = 0; /* 1 zoom, 2 perspective, 3 drop, 4 N */
 static char *g_kb_text = 0;
 
@@ -193,12 +194,13 @@ static bool kb_start(int target, char *text) {
     jstring js = env->NewStringUTF(text ? text : "");
     g_kb_target = target;
     g_kb_text = text;
+    g_kb_status = -1;
     g_kb_open = false;
 
     /* MainActivity.showKeyboard() is MCPE's own input bridge.  It creates and
      * focuses TextInputProxyEditTextbox on the UI thread internally, so do not
      * create another EditText or call InputMethodManager ourselves. */
-    env->CallVoidMethod(g_kb_activity, show, js, 0, JNI_FALSE, JNI_FALSE);
+    env->CallVoidMethod(g_kb_activity, show, js, 16, JNI_FALSE, JNI_FALSE);
     if (env->ExceptionCheck()) {
         env->ExceptionClear();
         nclog("keyboard: showKeyboard threw");
@@ -246,8 +248,9 @@ static void kb_poll() {
         }
     }
 
-    /* MCPE changes _userInputStatus when the native text box finishes/cancels.
-     * Keep the ImGui field live while it is 0 and close our bridge afterwards. */
+    /* MCPE uses -1 while the hidden Android textbox is still active.  The old
+     * implementation treated 1/0 backwards and immediately called hideKeyboard()
+     * on the very first frame, so the real keyboard never became visible. */
     int st = 0;
     if (status) {
         st = env->CallIntMethod(g_kb_activity, status);
@@ -257,7 +260,7 @@ static void kb_poll() {
     if (ac) env->DeleteLocalRef(ac);
     kb_release(env, attached);
 
-    if (st != 0) {
+    if (st != -1) {
         /* hideKeyboard is idempotent in the 1.1.5 activity implementation. */
         bool a2 = false;
         JNIEnv *e2 = kb_env(&a2);
@@ -270,6 +273,7 @@ static void kb_poll() {
             kb_release(e2, a2);
         }
         g_kb_open = false;
+        g_kb_status = st;
         g_kb_target = 0;
         g_kb_text = 0;
     }
@@ -278,6 +282,7 @@ static void kb_poll() {
 static void kb_stop() {
     if (!g_kb_open || !g_kb_activity) {
         g_kb_open = false;
+        g_kb_status = -1;
         g_kb_target = 0;
         g_kb_text = 0;
         return;
@@ -361,6 +366,10 @@ static GLint g_hit_mvp = -1, g_hit_col = -1;
 static bool g_hit_gl_ready = false;
 static bool g_hit_symbols_ready = false;
 static bool g_hit_logged_symbols = false;
+static uintptr_t g_hit_dragon_vtable = 0;
+static bool g_hit_dragon_ready = false;
+static void *g_hit_seen[256];
+static int g_hit_seen_n = 0;
 
 static int snapshot_arrow_count(void *player) {
     /*
@@ -415,8 +424,11 @@ static void hook_tick(void *self, void *player) {
     if (g_orig_tick) g_orig_tick(self, player);
     if (!player) return;
     g_tick_time = now_s();
+    const float *pos = entity_getPos(player);
+    if (pos) {
+        g_snap.x = pos[0]; g_snap.y = pos[1]; g_snap.z = pos[2];
+    }
     if (g_cfg.speed_on) {
-        const float *pos = entity_getPos(player);
         double t = g_tick_time;
         if (pos) {
             float px = pos[0], py = pos[1], pz = pos[2];
@@ -514,6 +526,11 @@ static void *hit_dlsym(const char *name) {
 
 static bool hit_resolve_symbols() {
     if (g_hit_symbols_ready) return true;
+    if (!g_hit_dragon_ready) {
+        void *vt = hit_dlsym("_ZTV11EnderDragon");
+        if (vt) g_hit_dragon_vtable = (uintptr_t)vt + sizeof(void*) * 2;
+        g_hit_dragon_ready = true;
+    }
     g_projection_slot = (void **)hit_dlsym("_ZN11MatrixStack10ProjectionE");
     g_view_slot       = (void **)hit_dlsym("_ZN11MatrixStack4ViewE");
     g_matrix_get_top  = (fn_matrix_get_top)hit_dlsym("_ZN11MatrixStack6getTopEv");
@@ -690,8 +707,121 @@ static void hit_look_line(float *v, int *n, const NcAabb6 &b, float pitch, float
              sx + dx * len, sy0 + dy * len, sz + dz * len);
 }
 
+static bool hit_is_dragon(void *entity) {
+    if (!entity || !g_hit_dragon_vtable) return false;
+    uintptr_t vt = *(const uintptr_t *)entity;
+    return vt == g_hit_dragon_vtable;
+}
+
+static bool hit_seen_entity(void *entity) {
+    for (int i = 0; i < g_hit_seen_n; ++i)
+        if (g_hit_seen[i] == entity) return true;
+    if (g_hit_seen_n < (int)(sizeof(g_hit_seen) / sizeof(g_hit_seen[0])))
+        g_hit_seen[g_hit_seen_n++] = entity;
+    return false;
+}
+
+static void hit_add_box(float *v, int *n, const NcAabb6 &b) {
+    hit_aabb_edges(v, n, b);
+}
+
+static void hit_box_center(float *v, int *n, float cx, float cy, float cz,
+                          float hx, float hy, float hz) {
+    NcAabb6 b;
+    b.minx = cx - hx; b.miny = cy - hy; b.minz = cz - hz;
+    b.maxx = cx + hx; b.maxy = cy + hy; b.maxz = cz + hz;
+    hit_aabb_edges(v, n, b);
+}
+
+/*
+ * EnderDragon is a multipart entity in the old PE renderer.  Its single Entity::bb
+ * is the coarse overall bounds; drawing that alone looks wrong because the dragon
+ * is made from a body plus head/neck/tail/wing parts.  The legacy renderer uses the
+ * classic part sizes: body 8x8, head 6x6, and 4x4 tail/wing sections.  Build stable
+ * local-space component boxes from those dimensions and the entity's current yaw.
+ * This intentionally avoids getLatencyPos(): in this binary that method returns
+ * cached movement offsets, not world-space XYZ coordinates.
+ */
+static void hit_add_dragon_boxes(float *v, int *n, void *entity,
+                                 const NcAabb6 &main_box, const float *entity_pos,
+                                 float yaw) {
+    if (!hit_is_dragon(entity) || !entity_pos) return;
+
+    const float pi = 3.14159265358979323846f;
+    const float rad = yaw * (pi / 180.0f);
+    const float sy = sinf(rad);
+    const float cy = cosf(rad);
+
+    /* Same forward convention as the blue facing line: yaw 0 -> -Z. */
+    const float fx = -sy, fz = cy;
+    const float rx = cy,  rz = sy;
+
+    const float world_w = fmaxf(main_box.maxx - main_box.minx,
+                                main_box.maxz - main_box.minz);
+    const float scale = clampf(world_w / 16.0f, 0.60f, 1.40f);
+
+    /* Entity::bb is world-space. Convert its center into this entity's local space. */
+    const float center_x = ((main_box.minx + main_box.maxx) * 0.5f) - entity_pos[0];
+    const float center_y = ((main_box.miny + main_box.maxy) * 0.5f) - entity_pos[1];
+    const float center_z = ((main_box.minz + main_box.maxz) * 0.5f) - entity_pos[2];
+
+    const float body_h = 4.0f * scale;
+    const float head_h = 3.0f * scale;
+    const float part_h = 2.0f * scale;
+
+    /* Main body. */
+    hit_box_center(v, n, center_x, center_y, center_z,
+                   4.0f * scale, body_h, 4.0f * scale);
+
+    /* Neck + head toward the dragon's facing direction. */
+    float x = center_x + fx * (2.0f * scale);
+    float z = center_z + fz * (2.0f * scale);
+    hit_box_center(v, n, x, center_y + 1.0f * scale, z,
+                   2.0f * scale, 2.0f * scale, 2.0f * scale);
+
+    x = center_x + fx * (5.5f * scale);
+    z = center_z + fz * (5.5f * scale);
+    hit_box_center(v, n, x, center_y + 1.5f * scale, z,
+                   head_h, head_h, head_h);
+
+    /* Three tail sections in the opposite direction. */
+    const float tail_off[3] = { 4.5f, 7.5f, 10.0f };
+    const float tail_half[3] = { 2.0f, 1.8f, 1.6f };
+    for (int i = 0; i < 3; ++i) {
+        x = center_x - fx * (tail_off[i] * scale);
+        z = center_z - fz * (tail_off[i] * scale);
+        hit_box_center(v, n, x, center_y, z,
+                       tail_half[i] * scale, tail_half[i] * scale,
+                       tail_half[i] * scale);
+    }
+
+    /* Two wings, one on each side of the body. */
+    const float wing_side = 5.0f * scale;
+    const float wing_forward = 0.5f * scale;
+    x = center_x + rx * wing_side + fx * wing_forward;
+    z = center_z + rz * wing_side + fz * wing_forward;
+    hit_box_center(v, n, x, center_y + 1.0f * scale, z,
+                   part_h, part_h, part_h);
+
+    x = center_x - rx * wing_side + fx * wing_forward;
+    z = center_z - rz * wing_side + fz * wing_forward;
+    hit_box_center(v, n, x, center_y + 1.0f * scale, z,
+                   part_h, part_h, part_h);
+}
+
+static void hit_draw_lines(float *verts, int n, const float *mvp) {
+    glUniformMatrix4fv(g_hit_mvp, 1, GL_FALSE, mvp);
+    glBindBuffer(GL_ARRAY_BUFFER, g_hit_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(float) * n * 3), verts, GL_STREAM_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * (GLsizei)sizeof(float), (const void *)0);
+    glUniform4f(g_hit_col, 1.0f, 1.0f, 1.0f, 1.0f);
+    glDrawArrays(GL_LINES, 0, n - 2);
+}
+
 static void hit_draw_entity(void *entity, const float *render_pos, float partial) {
     if (!g_cfg.hitbox_on || !entity || !render_pos) return;
+    if (hit_seen_entity(entity)) return;
     if (!hit_resolve_symbols() || !hit_init_gl()) return;
 
     GLint depth_bits = 0;
@@ -717,11 +847,18 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
     NcVec2 rot = {0,0};
     entity_getInterpolatedRotation(&rot, entity, partial);
 
-    float verts[78]; /* 26 line segments' endpoints = 52? + line => 26 vertices actually 78 floats. */
+    float verts[1800];
     int n = 0;
-    hit_aabb_edges(verts, &n, b);      /* 24 vertices */
-    hit_look_line(verts, &n, b, rot.x, rot.y); /* +2 */
-    if (n != 26) return;
+    bool dragon = hit_is_dragon(entity);
+    if (dragon) {
+        /* The dragon uses its multipart boxes instead of the coarse overall AABB. */
+        hit_add_dragon_boxes(verts, &n, entity, *(const NcAabb6 *)aw, cp, rot.y);
+    } else {
+        hit_aabb_edges(verts, &n, b);      /* 24 vertices */
+    }
+    int box_vertex_count = n;
+    hit_look_line(verts, &n, b, rot.x, rot.y);
+    if (n < box_vertex_count + 2) return;
 
     if (*g_projection_slot == 0 || *g_view_slot == 0) return;
     float proj[16], view[16], model[16], vm[16], mvp[16];
@@ -789,10 +926,11 @@ static void hit_draw_entity(void *entity, const float *render_pos, float partial
     glDisable(GL_BLEND);
     glDisable(GL_CULL_FACE);
 
+    int line_start = n - 2;
     glUniform4f(g_hit_col, 1.0f, 1.0f, 1.0f, 1.0f);
-    glDrawArrays(GL_LINES, 0, 24);
-    glUniform4f(g_hit_col, 1.0f, 0.10f, 0.10f, 1.0f);
-    glDrawArrays(GL_LINES, 24, 2);
+    glDrawArrays(GL_LINES, 0, line_start);
+    glUniform4f(g_hit_col, 0.15f, 0.55f, 1.0f, 1.0f);
+    glDrawArrays(GL_LINES, line_start, 2);
 
     /* Restore EVERYTHING we touched. */
     glBindBuffer(GL_ARRAY_BUFFER, (GLuint)old_attr_buf);
@@ -962,7 +1100,7 @@ static int menu_font_mult(float h) {
 }
 
 /* ------------------------------------------------------------------ HUD elements */
-enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_SPEED, E_ELYTRA_ANGLE, E_ZOOM, E_PERSP, E_DROP, E_N, E_COUNT };
+enum { E_FPS, E_ARMOR, E_ELYTRA, E_ARROW, E_SPEED, E_COORDS, E_ELYTRA_ANGLE, E_ZOOM, E_PERSP, E_DROP, E_N, E_COUNT };
 
 static float fpx(float size) { return 8.0f * (float)size; }
 static ImVec2 txt(const char *s, float size) { return ImGui::GetFont()->CalcTextSizeA(fpx(size), FLT_MAX, 0.0f, s); }
@@ -1111,6 +1249,25 @@ static void draw_arrow(ImDrawList *dl, ImVec2 p, int count) {
 }
 
 
+/* ---- Coordinates HUD ---- */
+static ImVec2 size_coords() {
+    int dec = g_cfg.coords_precision - 1;
+    char b[96];
+    snprintf(b, sizeof b, "%.*f %.*f %.*f", dec, g_snap.x, dec, g_snap.y, dec, g_snap.z);
+    float s = g_cfg.coords_size, pad = 2.0f * s;
+    ImVec2 t = txt(b, s);
+    return V(t.x + 2.0f * pad, t.y + 2.0f * pad);
+}
+static void draw_coords(ImDrawList *dl, ImVec2 p) {
+    int dec = g_cfg.coords_precision - 1;
+    char b[96];
+    snprintf(b, sizeof b, "%.*f %.*f %.*f", dec, g_snap.x, dec, g_snap.y, dec, g_snap.z);
+    float s = g_cfg.coords_size, pad = 2.0f * s;
+    ImVec2 sz = size_coords();
+    if (g_cfg.coords_bg) box_col(dl, p, sz, g_cfg.coords_bg_alpha, s, g_cfg.coords_bg_col);
+    put_text_sh(dl, V(p.x + pad, p.y + pad), s, packed(g_cfg.coords_col, g_cfg.coords_alpha), b, !g_cfg.coords_bg);
+}
+
 /* ---- Elytra angle: actual Entity rotation X (pitch) from the 1.1.5 game object ---- */
 static ImVec2 size_elytra_angle() {
     float s = g_cfg.elytra_angle_size; float pad = 2.0f * s;
@@ -1207,17 +1364,17 @@ static bool button_at(const char *id, ImVec2 p, ImVec2 sz, const char *label, fl
 /* ---- per-element accessors used by "Move on screen" ---- */
 static int *elem_on(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_on; case E_ARMOR: return &g_cfg.armor_on; case E_ELYTRA: return &g_cfg.elytra_on;
-                 case E_ARROW: return &g_cfg.arrow_on; case E_SPEED: return &g_cfg.speed_on; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_on; case E_ZOOM: return &g_cfg.zoom_on; case E_PERSP: return &g_cfg.persp_on;
+                 case E_ARROW: return &g_cfg.arrow_on; case E_SPEED: return &g_cfg.speed_on; case E_COORDS: return &g_cfg.coords_on; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_on; case E_ZOOM: return &g_cfg.zoom_on; case E_PERSP: return &g_cfg.persp_on;
                  case E_DROP: return &g_cfg.drop_on; default: return 0; }
 }
 static float *elem_x(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_x; case E_ARMOR: return &g_cfg.armor_x; case E_ELYTRA: return &g_cfg.elytra_x;
-                 case E_ARROW: return &g_cfg.arrow_x; case E_SPEED: return &g_cfg.speed_x; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_x; case E_ZOOM: return &g_cfg.zoom_x; case E_PERSP: return &g_cfg.persp_x;
+                 case E_ARROW: return &g_cfg.arrow_x; case E_SPEED: return &g_cfg.speed_x; case E_COORDS: return &g_cfg.coords_x; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_x; case E_ZOOM: return &g_cfg.zoom_x; case E_PERSP: return &g_cfg.persp_x;
                  case E_DROP: return &g_cfg.drop_x; default: return &g_cfg.n_x; }
 }
 static float *elem_y(int e) {
     switch (e) { case E_FPS: return &g_cfg.fps_y; case E_ARMOR: return &g_cfg.armor_y; case E_ELYTRA: return &g_cfg.elytra_y;
-                 case E_ARROW: return &g_cfg.arrow_y; case E_SPEED: return &g_cfg.speed_y; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_y; case E_ZOOM: return &g_cfg.zoom_y; case E_PERSP: return &g_cfg.persp_y;
+                 case E_ARROW: return &g_cfg.arrow_y; case E_SPEED: return &g_cfg.speed_y; case E_COORDS: return &g_cfg.coords_y; case E_ELYTRA_ANGLE: return &g_cfg.elytra_angle_y; case E_ZOOM: return &g_cfg.zoom_y; case E_PERSP: return &g_cfg.persp_y;
                  case E_DROP: return &g_cfg.drop_y; default: return &g_cfg.n_y; }
 }
 static ImVec2 elem_size(int e) {
@@ -1227,6 +1384,7 @@ static ImVec2 elem_size(int e) {
         case E_ELYTRA: return size_elytra();
         case E_ARROW: return size_arrow();
         case E_SPEED: return size_speed();
+        case E_COORDS: return size_coords();
         case E_ELYTRA_ANGLE: return size_elytra_angle();
         case E_DROP:  return btn_size(g_cfg.drop_text,  g_cfg.drop_btn);
         case E_ZOOM:  return btn_size(g_cfg.zoom_text,  g_cfg.zoom_btn);
@@ -1248,7 +1406,7 @@ static void build_edit(float w, float h) {
     ImDrawList *dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(V(0, 0), V(w, h), IM_COL32(0, 0, 0, 120));
 
-    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "arrow", "speed", "elytra_angle", "zoom", "persp", "drop", "n" };
+    static const char *ids[E_COUNT] = { "fps", "armor", "elytra", "arrow", "speed", "coords", "elytra_angle", "zoom", "persp", "drop", "n" };
 
     for (int e = 0; e < E_COUNT; e++) {
         int *on = elem_on(e);
@@ -1387,6 +1545,15 @@ static void panel_speed() {
     hud_look(&g_cfg.speed_size, &g_cfg.speed_alpha, &g_cfg.speed_bg_alpha);
     hud_pos(&g_cfg.speed_x, &g_cfg.speed_y);
 }
+static void panel_coords() {
+    head("Coordinates", &g_cfg.coords_on, "Shows your XYZ position in the HUD.");
+    chk("Dark background", &g_cfg.coords_bg);
+    color_picker("Text color", &g_cfg.coords_col);
+    color_picker("Background color", &g_cfg.coords_bg_col);
+    hud_look(&g_cfg.coords_size, &g_cfg.coords_alpha, &g_cfg.coords_bg_alpha);
+    sl_i("Precision", &g_cfg.coords_precision, 1, 4);
+    hud_pos(&g_cfg.coords_x, &g_cfg.coords_y);
+}
 static void panel_elytra_angle() {
     head("Elytra angle", &g_cfg.elytra_angle_on, "Shows your actual flight pitch while gliding.");
     chk("Dark background", &g_cfg.elytra_angle_bg);
@@ -1479,6 +1646,7 @@ static const Mod g_mods[] = {
     { "Elytra indicator",   &g_cfg.elytra_on,  panel_elytra },
     { "Arrow HUD",          &g_cfg.arrow_on,   panel_arrow },
     { "Speed indicator",    &g_cfg.speed_on,   panel_speed },
+    { "Coordinates",        &g_cfg.coords_on,  panel_coords },
     { "Elytra angle",       &g_cfg.elytra_angle_on, panel_elytra_angle },
     { "Quick drop",         &g_cfg.drop_on,    panel_drop },
     { "No hurt cam",        &g_cfg.nohurt,     panel_nohurt },
@@ -1571,6 +1739,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool elytra_vis = g_cfg.elytra_on && in_world && g_snap.gliding && !g_menu_open && !g_edit;
     bool arrow_vis  = g_cfg.arrow_on && in_world && g_snap.holding_bow && !g_menu_open && !g_edit;
     bool speed_vis  = g_cfg.speed_on && in_world && !g_menu_open && !g_edit;
+    bool coords_vis = g_cfg.coords_on && in_world && !g_menu_open && !g_edit;
     bool elytra_angle_vis = g_cfg.elytra_angle_on && in_world && g_snap.gliding && g_snap.elytra_angle_valid && !g_menu_open && !g_edit;
     bool hud_btns   = play_hud && !in_settings && !g_menu_open && !g_edit;         /* the world itself */
     bool zoom_vis   = g_cfg.zoom_on && (hud_btns || (in_pause && g_cfg.zoom_pause && !g_menu_open && !g_edit));
@@ -1578,7 +1747,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
     bool drop_vis   = g_cfg.drop_on && (hud_btns || (in_pause && g_cfg.drop_pause && !g_menu_open && !g_edit));
     if (!zoom_vis) g_zoom_active = 0;
 
-    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || speed_vis || elytra_angle_vis || zoom_vis || persp_vis || drop_vis || menu_reach || g_menu_open || g_edit;
+    bool need = fps_vis || armor_vis || elytra_vis || arrow_vis || speed_vis || coords_vis || elytra_angle_vis || zoom_vis || persp_vis || drop_vis || menu_reach || g_menu_open || g_edit;
     if (g_frames % 900 == 0 && g_beats < 6) {
         g_beats++;
         nclog("heartbeat: frames=%d settings=%d pause=%d world=%d play=%d menu=%d fps=%.0f", g_frames, g_settings_this != 0,
@@ -1648,6 +1817,7 @@ static void nc_frame(EGLDisplay d, EGLSurface s) {
         if (elytra_vis) draw_elytra(fg, place(g_cfg.elytra_x, g_cfg.elytra_y, size_elytra()));
         if (arrow_vis)  draw_arrow(fg, place(g_cfg.arrow_x, g_cfg.arrow_y, size_arrow()), g_snap.arrow_count);
         if (speed_vis)  draw_speed(fg, place(g_cfg.speed_x, g_cfg.speed_y, size_speed()), g_snap.speed_bps);
+        if (coords_vis) draw_coords(fg, place(g_cfg.coords_x, g_cfg.coords_y, size_coords()));
         if (elytra_angle_vis) draw_elytra_angle(fg, place(g_cfg.elytra_angle_x, g_cfg.elytra_angle_y, size_elytra_angle()));
 
         if (zoom_vis) {
@@ -1706,6 +1876,7 @@ typedef EGLBoolean (*swap_fn)(EGLDisplay, EGLSurface);
 static swap_fn g_orig_swap = 0;
 static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
     nc_frame(d, s);
+    g_hit_seen_n = 0;
     return g_orig_swap(d, s);
 }
 
