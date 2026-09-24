@@ -214,76 +214,88 @@ static bool kb_show(JNIEnv *env) {
     return ok == JNI_TRUE;
 }
 
+/* MCPE 1.1.5 already has its own native text-input bridge in MainActivity.
+ * Use that instead of creating a second EditText ourselves.  The game's
+ * showKeyboard()/getUserInputString()/hideKeyboard() path is designed to be
+ * called from native code and takes care of the Android UI-thread/IME work. */
 static bool kb_start(int target, char *text) {
-    bool attached = false; JNIEnv *env = kb_env(&attached); if (!env) return false;
+    bool attached = false;
+    JNIEnv *env = kb_env(&attached);
+    if (!env) return false;
     if (!g_kb_activity) g_kb_activity = kb_find_activity(env);
     if (!g_kb_activity) { kb_release(env, attached); return false; }
-    jclass ec = env->FindClass("android/widget/EditText");
-    if (!ec) { kb_release(env, attached); return false; }
-    jmethodID ctor = env->GetMethodID(ec, "<init>", "(Landroid/content/Context;)V");
-    if (!ctor) { kb_release(env, attached); return false; }
-    g_kb_edit = env->NewGlobalRef(env->NewObject(ec, ctor, g_kb_activity));
-    if (!g_kb_edit) { kb_release(env, attached); return false; }
-    jmethodID setText = env->GetMethodID(ec, "setText", "(Ljava/lang/CharSequence;)V");
-    jmethodID setAlpha = env->GetMethodID(ec, "setAlpha", "(F)V");
-    jmethodID setInput = env->GetMethodID(ec, "setInputType", "(I)V");
-    jstring js = env->NewStringUTF(text ? text : "");
-    if (setText) env->CallVoidMethod(g_kb_edit, setText, js);
-    if (setAlpha) env->CallVoidMethod(g_kb_edit, setAlpha, 0.0f);
-    if (setInput) env->CallVoidMethod(g_kb_edit, setInput, 1); /* TYPE_CLASS_TEXT */
-    if (js) env->DeleteLocalRef(js);
-    /* addContentView is normally expected on the UI thread; old MCPE often renders on the
-     * main thread, so try it directly and fall back gracefully if Android rejects it. */
+
     jclass ac = env->GetObjectClass(g_kb_activity);
-    jmethodID add = env->GetMethodID(ac, "addContentView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V");
-    jclass lpc = env->FindClass("android/view/ViewGroup$LayoutParams");
-    jmethodID lpctor = lpc ? env->GetMethodID(lpc, "<init>", "(II)V") : 0;
-    jobject lp = lpctor ? env->NewObject(lpc, lpctor, 1, 1) : 0;
-    if (!add || !lp) { kb_release(env, attached); return false; }
-    env->CallVoidMethod(g_kb_activity, add, g_kb_edit, lp);
-    if (env->ExceptionCheck()) { env->ExceptionClear(); kb_release(env, attached); return false; }
-    g_kb_target = target; g_kb_text = text; g_kb_open = kb_show(env);
+    jmethodID show = env->GetMethodID(ac, "showKeyboard", "(Ljava/lang/String;IZZ)V");
+    if (!show) {
+        if (ac) env->DeleteLocalRef(ac);
+        kb_release(env, attached);
+        return false;
+    }
+
+    jstring js = env->NewStringUTF(text ? text : "");
+    env->CallVoidMethod(g_kb_activity, show, js, JNI_FALSE, JNI_FALSE);
+    if (js) env->DeleteLocalRef(js);
+    bool failed = env->ExceptionCheck();
+    if (failed) env->ExceptionClear();
+    if (ac) env->DeleteLocalRef(ac);
+
+    g_kb_target = target;
+    g_kb_text = text;
+    g_kb_open = !failed;
     kb_release(env, attached);
     return g_kb_open;
 }
 
 static void kb_poll() {
-    if (!g_kb_open || !g_kb_edit || !g_kb_text) return;
-    bool attached = false; JNIEnv *env = kb_env(&attached); if (!env) return;
-    jclass ec = env->FindClass("android/widget/EditText");
-    jmethodID get = ec ? env->GetMethodID(ec, "getText", "()Landroid/text/Editable;") : 0;
-    jobject ed = get ? env->CallObjectMethod(g_kb_edit, get) : 0;
-    if (ed) {
-        jclass oc = env->FindClass("java/lang/Object");
-        jmethodID ts = oc ? env->GetMethodID(oc, "toString", "()Ljava/lang/String;") : 0;
-        jstring js = ts ? (jstring)env->CallObjectMethod(ed, ts) : 0;
-        if (js) { const char *u = env->GetStringUTFChars(js, 0); if (u) { strncpy(g_kb_text, u, 16); g_kb_text[16] = 0; env->ReleaseStringUTFChars(js, u); } env->DeleteLocalRef(js); }
-        env->DeleteLocalRef(ed);
+    if (!g_kb_open || !g_kb_text || !g_kb_activity) return;
+    bool attached = false;
+    JNIEnv *env = kb_env(&attached);
+    if (!env) return;
+
+    jclass ac = env->GetObjectClass(g_kb_activity);
+    jmethodID get = ac ? env->GetMethodID(ac, "getUserInputString", "()[Ljava/lang/String;") : 0;
+    if (get) {
+        jobjectArray arr = (jobjectArray)env->CallObjectMethod(g_kb_activity, get);
+        if (!env->ExceptionCheck() && arr) {
+            jsize n = env->GetArrayLength(arr);
+            if (n > 0) {
+                jstring js = (jstring)env->GetObjectArrayElement(arr, 0);
+                if (js) {
+                    const char *u = env->GetStringUTFChars(js, 0);
+                    if (u) {
+                        strncpy(g_kb_text, u, 16);
+                        g_kb_text[16] = 0;
+                        env->ReleaseStringUTFChars(js, u);
+                    }
+                    env->DeleteLocalRef(js);
+                }
+            }
+            env->DeleteLocalRef(arr);
+        } else if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
     }
+    if (ac) env->DeleteLocalRef(ac);
     kb_release(env, attached);
 }
 
 static void kb_stop() {
-    if (!g_kb_open) return;
-    bool attached = false; JNIEnv *env = kb_env(&attached); if (!env) return;
-    jclass viewc = env->FindClass("android/view/View");
-    jclass immc = env->FindClass("android/view/inputmethod/InputMethodManager");
-    if (viewc && immc && g_kb_edit) {
-        jmethodID ctx = env->GetMethodID(viewc, "getContext", "()Landroid/content/Context;");
-        jobject context = ctx ? env->CallObjectMethod(g_kb_edit, ctx) : 0;
-        jclass cc = env->FindClass("android/content/Context");
-        jmethodID getsvc = cc ? env->GetMethodID(cc, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;") : 0;
-        jfieldID sf = cc ? env->GetStaticFieldID(cc, "INPUT_METHOD_SERVICE", "Ljava/lang/String;") : 0;
-        jstring name = (sf && cc) ? (jstring)env->GetStaticObjectField(cc, sf) : 0;
-        jobject imm = (getsvc && context) ? env->CallObjectMethod(context, getsvc, name) : 0;
-        jmethodID hide = imm ? env->GetMethodID(immc, "hideSoftInputFromWindow", "(Landroid/os/IBinder;I)Z") : 0;
-        jmethodID token = viewc ? env->GetMethodID(viewc, "getWindowToken", "()Landroid/os/IBinder;") : 0;
-        jobject tok = token ? env->CallObjectMethod(g_kb_edit, token) : 0;
-        if (hide && tok) env->CallBooleanMethod(imm, hide, tok, 0);
-        if (tok) env->DeleteLocalRef(tok); if (imm) env->DeleteLocalRef(imm); if (name) env->DeleteLocalRef(name); if (context) env->DeleteLocalRef(context);
+    if (!g_kb_open || !g_kb_activity) {
+        g_kb_open = false; g_kb_target = 0; g_kb_text = 0;
+        return;
     }
-    if (g_kb_edit) { env->DeleteGlobalRef(g_kb_edit); g_kb_edit = 0; }
-    g_kb_open = false; g_kb_target = 0; g_kb_text = 0;
+    bool attached = false;
+    JNIEnv *env = kb_env(&attached);
+    if (!env) return;
+    jclass ac = env->GetObjectClass(g_kb_activity);
+    jmethodID hide = ac ? env->GetMethodID(ac, "hideKeyboard", "()V") : 0;
+    if (hide) env->CallVoidMethod(g_kb_activity, hide);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (ac) env->DeleteLocalRef(ac);
+    g_kb_open = false;
+    g_kb_target = 0;
+    g_kb_text = 0;
     kb_release(env, attached);
 }
 
@@ -1124,7 +1136,7 @@ static void draw_elytra_angle(ImDrawList *dl, ImVec2 p) {
     float s = g_cfg.elytra_angle_size; float a = g_cfg.elytra_angle_alpha, pad = 2.0f * s;
     ImVec2 sz = size_elytra_angle();
     if (g_cfg.elytra_angle_bg) box_col(dl, p, sz, g_cfg.elytra_angle_bg_alpha, s, g_cfg.elytra_angle_bg_col);
-    char b[32]; snprintf(b, sizeof b, "Angle: %.1f deg", g_snap.elytra_angle);
+    char b[32]; snprintf(b, sizeof b, "%.0f°", g_snap.elytra_angle);
     put_text_sh(dl, V(p.x + pad, p.y + pad), s, packed(g_cfg.elytra_angle_col, a), b, !g_cfg.elytra_angle_bg);
 }
 
