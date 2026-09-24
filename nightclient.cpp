@@ -117,6 +117,9 @@ static bool g_kb_open = false;
 static int g_kb_target = 0; /* 1 zoom, 2 perspective, 3 drop, 4 N */
 static char *g_kb_text = 0;
 
+/* Forward declaration: the keyboard bridge is above the logger definition. */
+static void nclog(const char *fmt, ...);
+
 typedef jint (*fn_JNI_GetCreatedJavaVMs)(JavaVM **, jsize, jsize *);
 
 static bool kb_get_vm() {
