@@ -42,6 +42,8 @@ int nc_cfg_load(NcConfig *c, const char *path) {
             if (!strcmp(line, FIELDS[i].key)) {
                 if (FIELDS[i].is_float)
                     set_field(c, &FIELDS[i], (float)strtod(eq + 1, NULL));
+                else if (strstr(FIELDS[i].key, "_col") || strstr(FIELDS[i].key, "_bg_col"))
+                    set_field(c, &FIELDS[i], (float)strtoul(eq + 1, NULL, 0));
                 else
                     set_field(c, &FIELDS[i], (float)strtol(eq + 1, NULL, 0));
                 goto loaded_line;
@@ -49,21 +51,25 @@ int nc_cfg_load(NcConfig *c, const char *path) {
         }
 
         if (!strcmp(line, "zoom_text")) {
+            eq[strcspn(eq + 1, "\r\n")] = 0;
             strncpy(c->zoom_text, eq + 1, sizeof(c->zoom_text) - 1);
             c->zoom_text[sizeof(c->zoom_text) - 1] = 0;
             goto loaded_line;
         }
         if (!strcmp(line, "persp_text")) {
+            eq[strcspn(eq + 1, "\r\n")] = 0;
             strncpy(c->persp_text, eq + 1, sizeof(c->persp_text) - 1);
             c->persp_text[sizeof(c->persp_text) - 1] = 0;
             goto loaded_line;
         }
         if (!strcmp(line, "drop_text")) {
+            eq[strcspn(eq + 1, "\r\n")] = 0;
             strncpy(c->drop_text, eq + 1, sizeof(c->drop_text) - 1);
             c->drop_text[sizeof(c->drop_text) - 1] = 0;
             goto loaded_line;
         }
         if (!strcmp(line, "n_text")) {
+            eq[strcspn(eq + 1, "\r\n")] = 0;
             strncpy(c->n_text, eq + 1, sizeof(c->n_text) - 1);
             c->n_text[sizeof(c->n_text) - 1] = 0;
             goto loaded_line;

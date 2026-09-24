@@ -349,6 +349,10 @@ static fn_ptr   g_orig_ptr = 0;
 static fn_getb  g_orig_fancy = 0, g_orig_skies = 0, g_orig_light = 0, g_orig_bobview = 0;
 static fn_geti  g_orig_view = 0;
 static fn_entity_render g_orig_entity_render = 0;
+static fn_entity_render g_orig_xp_render = 0;
+static fn_entity_render g_orig_crystal_render = 0;
+static fn_entity_render g_orig_crystal_effects = 0;
+static void *g_local_player = 0;
 
 /* Exact 1.1.5 Entity::bb layout: Entity + 0x104 contains
  * six floats in AABB order: minX,minY,minZ,maxX,maxY,maxZ.
@@ -423,6 +427,7 @@ static void hook_apply(void *self, float dt) {
 static void hook_tick(void *self, void *player) {
     if (g_orig_tick) g_orig_tick(self, player);
     if (!player) return;
+    g_local_player = player;
     g_tick_time = now_s();
     const float *pos = entity_getPos(player);
     if (pos) {
@@ -962,6 +967,35 @@ static void hook_entity_render(void *self, void *entity, const void *pos, float 
         g_orig_entity_render(self, entity, pos, yaw, partial);
     if (g_cfg.hitbox_on && entity && pos)
         hit_draw_entity(entity, (const float *)pos, partial);
+}
+
+/* ------------------------------------------------------------------ local entity render optimizers
+ * These are deliberately render-only: they never change entity state, inventory,
+ * placement, packets, or combat input. They only avoid expensive local rendering.
+ */
+static bool opt_in_range(void *entity, float max_dist) {
+    if (!entity || !g_local_player || max_dist <= 0.0f) return true;
+    const float *p = entity_getPos(entity);
+    if (!p) return true;
+    float dx = p[0] - g_snap.x;
+    float dy = p[1] - g_snap.y;
+    float dz = p[2] - g_snap.z;
+    return (dx * dx + dy * dy + dz * dz) <= max_dist * max_dist;
+}
+
+static void hook_xp_render(void *self, void *entity, const void *pos, float yaw, float partial) {
+    if (g_cfg.xp_opt_on && !opt_in_range(entity, g_cfg.xp_opt_dist)) return;
+    if (g_orig_xp_render) g_orig_xp_render(self, entity, pos, yaw, partial);
+}
+
+static void hook_crystal_render(void *self, void *entity, const void *pos, float yaw, float partial) {
+    if (g_cfg.crystal_opt_on && !opt_in_range(entity, g_cfg.crystal_opt_dist)) return;
+    if (g_orig_crystal_render) g_orig_crystal_render(self, entity, pos, yaw, partial);
+}
+
+static void hook_crystal_effects(void *self, void *entity, const void *pos, float yaw, float partial) {
+    if (g_cfg.crystal_opt_on && g_cfg.crystal_opt_effects) return;
+    if (g_orig_crystal_effects) g_orig_crystal_effects(self, entity, pos, yaw, partial);
 }
 
 /* FPS optimizer: change what the game's option getters answer */
@@ -1545,6 +1579,17 @@ static void panel_speed() {
     hud_look(&g_cfg.speed_size, &g_cfg.speed_alpha, &g_cfg.speed_bg_alpha);
     hud_pos(&g_cfg.speed_x, &g_cfg.speed_y);
 }
+static void panel_xp_optimizer() {
+    head("XP optimizer", &g_cfg.xp_opt_on, "Local-only XP orb rendering optimization. It does not change XP pickup or gameplay.");
+    sl_f("Render distance", &g_cfg.xp_opt_dist, 4.0f, 64.0f);
+    ImGui::TextDisabled("XP orbs farther than this are skipped by the local renderer.");
+}
+static void panel_crystal_optimizer() {
+    head("Crystal optimizer", &g_cfg.crystal_opt_on, "Local-only End Crystal rendering optimization. It does not place, aim, or attack.");
+    sl_f("Render distance", &g_cfg.crystal_opt_dist, 4.0f, 64.0f);
+    chk("Disable crystal beam/effects", &g_cfg.crystal_opt_effects);
+    ImGui::TextDisabled("Only the local crystal renderer is changed for performance.");
+}
 static void panel_coords() {
     head("Coordinates", &g_cfg.coords_on, "Shows your XYZ position in the HUD.");
     chk("Dark background", &g_cfg.coords_bg);
@@ -1647,6 +1692,8 @@ static const Mod g_mods[] = {
     { "Arrow HUD",          &g_cfg.arrow_on,   panel_arrow },
     { "Speed indicator",    &g_cfg.speed_on,   panel_speed },
     { "Coordinates",        &g_cfg.coords_on,  panel_coords },
+    { "XP optimizer",        &g_cfg.xp_opt_on, panel_xp_optimizer },
+    { "Crystal optimizer",   &g_cfg.crystal_opt_on, panel_crystal_optimizer },
     { "Elytra angle",       &g_cfg.elytra_angle_on, panel_elytra_angle },
     { "Quick drop",         &g_cfg.drop_on,    panel_drop },
     { "No hurt cam",        &g_cfg.nohurt,     panel_nohurt },
@@ -1932,6 +1979,13 @@ static void nc_init(void) {
     if (g_cfg.hook_persp) reg("perspective",
         "_ZN20ClientInputCallbacks21handlePointerLocationER14ClientInstanceRK24PointerLocationEventData11FocusImpact",
         (void *)hook_ptr, (void **)&g_orig_ptr);
+    if (g_cfg.hook_xp) {
+        reg("XP orb render optimizer", "_ZN21ExperienceOrbRenderer6renderER6EntityRK4Vec3ff", (void *)hook_xp_render, (void **)&g_orig_xp_render);
+    }
+    if (g_cfg.hook_crystal) {
+        reg("End Crystal render optimizer", "_ZN20EnderCrystalRenderer6renderER6EntityRK4Vec3ff", (void *)hook_crystal_render, (void **)&g_orig_crystal_render);
+        reg("End Crystal effects optimizer", "_ZN20EnderCrystalRenderer13renderEffectsER6EntityRK4Vec3ff", (void *)hook_crystal_effects, (void **)&g_orig_crystal_effects);
+    }
     if (g_cfg.hook_hitbox) {
         reg("entity render hitboxes", "_ZN22EntityRenderDispatcher6renderER6EntityRK4Vec3ff", (void *)hook_entity_render, (void **)&g_orig_entity_render);
     }
