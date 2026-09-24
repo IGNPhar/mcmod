@@ -153,20 +153,49 @@ static void kb_release(JNIEnv *env, bool attached) { if (attached && g_jvm) g_jv
  * if the old MCPE build exposes no Java VM/activity, the text field still works as an
  * ImGui field but no soft keyboard is requested. */
 static jobject kb_find_activity(JNIEnv *env) {
-    /* MCPE 1.1.5 keeps the real MainActivity in a public static singleton.
-     * ActivityThread/mActivities reflection is unreliable on newer Android
-     * releases, which is why the old keyboard bridge could create the ImGui
-     * cursor but never bring up the IME. */
-    jclass mc = env->FindClass("com/mojang/minecraftpe/MainActivity");
-    if (!mc) return 0;
-    jfieldID inst = env->GetStaticFieldID(mc, "mInstance", "Lcom/mojang/minecraftpe/MainActivity;");
-    if (!inst) { env->DeleteLocalRef(mc); return 0; }
-    jobject obj = env->GetStaticObjectField(mc, inst);
-    if (!obj) { env->DeleteLocalRef(mc); return 0; }
-    jobject global = env->NewGlobalRef(obj);
-    env->DeleteLocalRef(obj);
-    env->DeleteLocalRef(mc);
-    return global;
+    /* Native code executing on a thread attached directly through JavaVM may have
+     * no application ClassLoader, so FindClass("com/mojang/...") can fail even
+     * though MCPE itself is running.  Resolve MainActivity through the app's
+     * actual ClassLoader and then read its mInstance singleton. */
+    jclass at = env->FindClass("android/app/ActivityThread");
+    if (!at) return 0;
+    jmethodID currentApp = env->GetStaticMethodID(at, "currentApplication", "()Landroid/app/Application;");
+    if (!currentApp) { env->DeleteLocalRef(at); return 0; }
+    jobject app = env->CallStaticObjectMethod(at, currentApp);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); app = 0; }
+    if (!app) { env->DeleteLocalRef(at); return 0; }
+
+    jclass appCls = env->GetObjectClass(app);
+    jmethodID getCl = appCls ? env->GetMethodID(appCls, "getClassLoader", "()Ljava/lang/ClassLoader;") : 0;
+    jobject loader = getCl ? env->CallObjectMethod(app, getCl) : 0;
+    if (env->ExceptionCheck()) { env->ExceptionClear(); loader = 0; }
+
+    jobject result = 0;
+    if (loader) {
+        jclass clCls = env->FindClass("java/lang/ClassLoader");
+        jmethodID load = clCls ? env->GetMethodID(clCls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;") : 0;
+        jstring name = env->NewStringUTF("com.mojang.minecraftpe.MainActivity");
+        jobject mc = load ? env->CallObjectMethod(loader, load, name) : 0;
+        if (env->ExceptionCheck()) { env->ExceptionClear(); mc = 0; }
+        if (mc) {
+            jclass mcCls = (jclass)mc;
+            jfieldID inst = env->GetStaticFieldID(mcCls, "mInstance", "Lcom/mojang/minecraftpe/MainActivity;");
+            if (inst) {
+                jobject obj = env->GetStaticObjectField(mcCls, inst);
+                if (obj) result = env->NewGlobalRef(obj);
+                if (obj) env->DeleteLocalRef(obj);
+            }
+            env->DeleteLocalRef(mcCls);
+        }
+        if (name) env->DeleteLocalRef(name);
+        if (clCls) env->DeleteLocalRef(clCls);
+    }
+
+    if (loader) env->DeleteLocalRef(loader);
+    if (appCls) env->DeleteLocalRef(appCls);
+    env->DeleteLocalRef(app);
+    env->DeleteLocalRef(at);
+    return result;
 }
 
 static bool kb_start(int target, char *text) {
@@ -174,8 +203,13 @@ static bool kb_start(int target, char *text) {
     JNIEnv *env = kb_env(&attached);
     if (!env) return false;
 
-    if (!g_kb_activity)
-        g_kb_activity = kb_find_activity(env);
+    /* Refresh the Activity reference on every edit start. MainActivity can be
+     * recreated after returning from the launcher/settings. */
+    if (g_kb_activity) {
+        env->DeleteGlobalRef(g_kb_activity);
+        g_kb_activity = 0;
+    }
+    g_kb_activity = kb_find_activity(env);
     if (!g_kb_activity) {
         nclog("keyboard: MainActivity.mInstance unavailable");
         kb_release(env, attached);
@@ -183,6 +217,7 @@ static bool kb_start(int target, char *text) {
     }
 
     jclass ac = env->GetObjectClass(g_kb_activity);
+    jmethodID init = ac ? env->GetMethodID(ac, "initiateUserInput", "(I)V") : 0;
     jmethodID show = ac ? env->GetMethodID(ac, "showKeyboard", "(Ljava/lang/String;IZZ)V") : 0;
     if (!show) {
         nclog("keyboard: showKeyboard method unavailable");
@@ -197,10 +232,20 @@ static bool kb_start(int target, char *text) {
     g_kb_status = -1;
     g_kb_open = false;
 
+    /* Initialize MCPE's native input state first.  The stock game does this
+     * before asking MainActivity to show the IME; calling showKeyboard alone
+     * leaves the proxy textbox in an uninitialized input session.  1 is the
+     * ordinary text input type used for these button labels. */
+    if (init) env->CallVoidMethod(g_kb_activity, init, 1);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        nclog("keyboard: initiateUserInput threw");
+    }
+
     /* MainActivity.showKeyboard() is MCPE's own input bridge.  It creates and
      * focuses TextInputProxyEditTextbox on the UI thread internally, so do not
      * create another EditText or call InputMethodManager ourselves. */
-    env->CallVoidMethod(g_kb_activity, show, js, 16, JNI_FALSE, JNI_FALSE);
+    env->CallVoidMethod(g_kb_activity, show, js, 1, JNI_FALSE, JNI_FALSE);
     if (env->ExceptionCheck()) {
         env->ExceptionClear();
         nclog("keyboard: showKeyboard threw");
@@ -224,8 +269,6 @@ static void kb_poll() {
 
     jclass ac = env->GetObjectClass(g_kb_activity);
     jmethodID get = ac ? env->GetMethodID(ac, "getUserInputString", "()[Ljava/lang/String;") : 0;
-    jmethodID status = ac ? env->GetMethodID(ac, "getUserInputStatus", "()I") : 0;
-
     if (get) {
         jobjectArray arr = (jobjectArray)env->CallObjectMethod(g_kb_activity, get);
         if (!env->ExceptionCheck() && arr) {
@@ -248,35 +291,13 @@ static void kb_poll() {
         }
     }
 
-    /* MCPE uses -1 while the hidden Android textbox is still active.  The old
-     * implementation treated 1/0 backwards and immediately called hideKeyboard()
-     * on the very first frame, so the real keyboard never became visible. */
-    int st = 0;
-    if (status) {
-        st = env->CallIntMethod(g_kb_activity, status);
-        if (env->ExceptionCheck()) { env->ExceptionClear(); st = 0; }
-    }
-
+    /* IMPORTANT: getUserInputStatus() is not a visibility flag.  On this old
+     * build it is initialized by the native input pipeline and may be 0 before
+     * the UI-thread showKeyboard() runnable has even executed.  Using it to
+     * auto-hide here makes the keyboard disappear before Android can display it.
+     * Keep the IME open until ImGui deactivates the field and kb_stop() is called. */
     if (ac) env->DeleteLocalRef(ac);
     kb_release(env, attached);
-
-    if (st != -1) {
-        /* hideKeyboard is idempotent in the 1.1.5 activity implementation. */
-        bool a2 = false;
-        JNIEnv *e2 = kb_env(&a2);
-        if (e2) {
-            jclass c2 = e2->GetObjectClass(g_kb_activity);
-            jmethodID hide = c2 ? e2->GetMethodID(c2, "hideKeyboard", "()V") : 0;
-            if (hide) e2->CallVoidMethod(g_kb_activity, hide);
-            if (e2->ExceptionCheck()) e2->ExceptionClear();
-            if (c2) e2->DeleteLocalRef(c2);
-            kb_release(e2, a2);
-        }
-        g_kb_open = false;
-        g_kb_status = st;
-        g_kb_target = 0;
-        g_kb_text = 0;
-    }
 }
 
 static void kb_stop() {
@@ -984,13 +1005,31 @@ static bool opt_in_range(void *entity, float max_dist) {
 }
 
 static void hook_xp_render(void *self, void *entity, const void *pos, float yaw, float partial) {
-    if (g_cfg.xp_opt_on && !opt_in_range(entity, g_cfg.xp_opt_dist)) return;
-    if (g_orig_xp_render) g_orig_xp_render(self, entity, pos, yaw, partial);
+    if (!g_orig_xp_render) return;
+    if (g_cfg.xp_opt_on) {
+        /* Render-only optimizer: reduce the interpolation window so an orb appears
+         * to advance toward its current tick position much sooner.  This never
+         * changes the orb entity, pickup radius, XP amount, packets, or tick rate. */
+        float p = clampf(partial * g_cfg.xp_opt_speed, 0.0f, 1.0f);
+        if (opt_in_range(entity, g_cfg.xp_opt_hide_near)) {
+            /* Near the player the real game will pick the orb up independently;
+             * locally hiding it avoids the last-frame visual linger. */
+            return;
+        }
+        g_orig_xp_render(self, entity, pos, yaw, p);
+        return;
+    }
+    g_orig_xp_render(self, entity, pos, yaw, partial);
 }
 
 static void hook_crystal_render(void *self, void *entity, const void *pos, float yaw, float partial) {
-    if (g_cfg.crystal_opt_on && !opt_in_range(entity, g_cfg.crystal_opt_dist)) return;
-    if (g_orig_crystal_render) g_orig_crystal_render(self, entity, pos, yaw, partial);
+    if (!g_orig_crystal_render) return;
+    if (g_cfg.crystal_opt_on && g_cfg.crystal_opt_anim) {
+        /* Feed a fixed interpolation point so the floating crystal model doesn't
+         * interpolate its extra frame-to-frame animation. */
+        partial = 0.0f;
+    }
+    g_orig_crystal_render(self, entity, pos, yaw, partial);
 }
 
 static void hook_crystal_effects(void *self, void *entity, const void *pos, float yaw, float partial) {
@@ -1580,15 +1619,16 @@ static void panel_speed() {
     hud_pos(&g_cfg.speed_x, &g_cfg.speed_y);
 }
 static void panel_xp_optimizer() {
-    head("XP optimizer", &g_cfg.xp_opt_on, "Local-only XP orb rendering optimization. It does not change XP pickup or gameplay.");
-    sl_f("Render distance", &g_cfg.xp_opt_dist, 4.0f, 64.0f);
-    ImGui::TextDisabled("XP orbs farther than this are skipped by the local renderer.");
+    head("XP optimizer", &g_cfg.xp_opt_on, "Local-only XP orb visual optimization. It does not change XP pickup or gameplay.");
+    sl_f("Visual speed", &g_cfg.xp_opt_speed, 1.0f, 8.0f);
+    sl_f("Hide radius", &g_cfg.xp_opt_hide_near, 0.25f, 4.0f);
+    ImGui::TextDisabled("Makes XP orbs visually advance sooner and removes the last-frame linger near you.");
 }
 static void panel_crystal_optimizer() {
-    head("Crystal optimizer", &g_cfg.crystal_opt_on, "Local-only End Crystal rendering optimization. It does not place, aim, or attack.");
-    sl_f("Render distance", &g_cfg.crystal_opt_dist, 4.0f, 64.0f);
+    head("Crystal optimizer", &g_cfg.crystal_opt_on, "Local-only End Crystal visual optimization.");
+    chk("Disable crystal animation", &g_cfg.crystal_opt_anim);
     chk("Disable crystal beam/effects", &g_cfg.crystal_opt_effects);
-    ImGui::TextDisabled("Only the local crystal renderer is changed for performance.");
+    ImGui::TextDisabled("Only the local crystal renderer/effects are changed.");
 }
 static void panel_coords() {
     head("Coordinates", &g_cfg.coords_on, "Shows your XYZ position in the HUD.");

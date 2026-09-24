@@ -51,27 +51,51 @@ int nc_cfg_load(NcConfig *c, const char *path) {
         }
 
         if (!strcmp(line, "zoom_text")) {
-            eq[strcspn(eq + 1, "\r\n")] = 0;
-            strncpy(c->zoom_text, eq + 1, sizeof(c->zoom_text) - 1);
-            c->zoom_text[sizeof(c->zoom_text) - 1] = 0;
+            char *v = eq + 1;
+            size_t n = strcspn(v, "\r\n");
+            v[n] = 0;
+            /* Never overwrite a valid default/custom label with an empty line.
+             * This repairs configs written by the broken keyboard build. */
+            if (n > 0) {
+                strncpy(c->zoom_text, v, sizeof(c->zoom_text) - 1);
+                c->zoom_text[sizeof(c->zoom_text) - 1] = 0;
+            }
             goto loaded_line;
         }
         if (!strcmp(line, "persp_text")) {
-            eq[strcspn(eq + 1, "\r\n")] = 0;
-            strncpy(c->persp_text, eq + 1, sizeof(c->persp_text) - 1);
-            c->persp_text[sizeof(c->persp_text) - 1] = 0;
+            char *v = eq + 1;
+            size_t n = strcspn(v, "\r\n");
+            v[n] = 0;
+            /* Never overwrite a valid default/custom label with an empty line.
+             * This repairs configs written by the broken keyboard build. */
+            if (n > 0) {
+                strncpy(c->persp_text, v, sizeof(c->persp_text) - 1);
+                c->persp_text[sizeof(c->persp_text) - 1] = 0;
+            }
             goto loaded_line;
         }
         if (!strcmp(line, "drop_text")) {
-            eq[strcspn(eq + 1, "\r\n")] = 0;
-            strncpy(c->drop_text, eq + 1, sizeof(c->drop_text) - 1);
-            c->drop_text[sizeof(c->drop_text) - 1] = 0;
+            char *v = eq + 1;
+            size_t n = strcspn(v, "\r\n");
+            v[n] = 0;
+            /* Never overwrite a valid default/custom label with an empty line.
+             * This repairs configs written by the broken keyboard build. */
+            if (n > 0) {
+                strncpy(c->drop_text, v, sizeof(c->drop_text) - 1);
+                c->drop_text[sizeof(c->drop_text) - 1] = 0;
+            }
             goto loaded_line;
         }
         if (!strcmp(line, "n_text")) {
-            eq[strcspn(eq + 1, "\r\n")] = 0;
-            strncpy(c->n_text, eq + 1, sizeof(c->n_text) - 1);
-            c->n_text[sizeof(c->n_text) - 1] = 0;
+            char *v = eq + 1;
+            size_t n = strcspn(v, "\r\n");
+            v[n] = 0;
+            /* Never overwrite a valid default/custom label with an empty line.
+             * This repairs configs written by the broken keyboard build. */
+            if (n > 0) {
+                strncpy(c->n_text, v, sizeof(c->n_text) - 1);
+                c->n_text[sizeof(c->n_text) - 1] = 0;
+            }
             goto loaded_line;
         }
 
@@ -80,6 +104,10 @@ loaded_line:
     }
 
     fclose(f);
+    if (!c->zoom_text[0]) strcpy(c->zoom_text, "Z");
+    if (!c->persp_text[0]) strcpy(c->persp_text, "F5");
+    if (!c->drop_text[0]) strcpy(c->drop_text, "Q");
+    if (!c->n_text[0]) strcpy(c->n_text, "N");
     return 1;
 }
 
