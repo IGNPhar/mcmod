@@ -40,62 +40,29 @@ int nc_cfg_load(NcConfig *c, const char *path) {
 
         for (int i = 0; i < NC_NFIELDS; i++) {
             if (!strcmp(line, FIELDS[i].key)) {
-                if (FIELDS[i].is_float)
-                    set_field(c, &FIELDS[i], (float)strtod(eq + 1, NULL));
-                else if (strstr(FIELDS[i].key, "_col") || strstr(FIELDS[i].key, "_bg_col"))
-                    set_field(c, &FIELDS[i], (float)strtoul(eq + 1, NULL, 0));
-                else
-                    set_field(c, &FIELDS[i], (float)strtol(eq + 1, NULL, 0));
+                set_field(c, &FIELDS[i], (float)atof(eq + 1));
                 goto loaded_line;
             }
         }
 
         if (!strcmp(line, "zoom_text")) {
-            char *v = eq + 1;
-            size_t n = strcspn(v, "\r\n");
-            v[n] = 0;
-            /* Never overwrite a valid default/custom label with an empty line.
-             * This repairs configs written by the broken keyboard build. */
-            if (n > 0) {
-                strncpy(c->zoom_text, v, sizeof(c->zoom_text) - 1);
-                c->zoom_text[sizeof(c->zoom_text) - 1] = 0;
-            }
+            strncpy(c->zoom_text, eq + 1, sizeof(c->zoom_text) - 1);
+            c->zoom_text[sizeof(c->zoom_text) - 1] = 0;
             goto loaded_line;
         }
         if (!strcmp(line, "persp_text")) {
-            char *v = eq + 1;
-            size_t n = strcspn(v, "\r\n");
-            v[n] = 0;
-            /* Never overwrite a valid default/custom label with an empty line.
-             * This repairs configs written by the broken keyboard build. */
-            if (n > 0) {
-                strncpy(c->persp_text, v, sizeof(c->persp_text) - 1);
-                c->persp_text[sizeof(c->persp_text) - 1] = 0;
-            }
+            strncpy(c->persp_text, eq + 1, sizeof(c->persp_text) - 1);
+            c->persp_text[sizeof(c->persp_text) - 1] = 0;
             goto loaded_line;
         }
         if (!strcmp(line, "drop_text")) {
-            char *v = eq + 1;
-            size_t n = strcspn(v, "\r\n");
-            v[n] = 0;
-            /* Never overwrite a valid default/custom label with an empty line.
-             * This repairs configs written by the broken keyboard build. */
-            if (n > 0) {
-                strncpy(c->drop_text, v, sizeof(c->drop_text) - 1);
-                c->drop_text[sizeof(c->drop_text) - 1] = 0;
-            }
+            strncpy(c->drop_text, eq + 1, sizeof(c->drop_text) - 1);
+            c->drop_text[sizeof(c->drop_text) - 1] = 0;
             goto loaded_line;
         }
         if (!strcmp(line, "n_text")) {
-            char *v = eq + 1;
-            size_t n = strcspn(v, "\r\n");
-            v[n] = 0;
-            /* Never overwrite a valid default/custom label with an empty line.
-             * This repairs configs written by the broken keyboard build. */
-            if (n > 0) {
-                strncpy(c->n_text, v, sizeof(c->n_text) - 1);
-                c->n_text[sizeof(c->n_text) - 1] = 0;
-            }
+            strncpy(c->n_text, eq + 1, sizeof(c->n_text) - 1);
+            c->n_text[sizeof(c->n_text) - 1] = 0;
             goto loaded_line;
         }
 
@@ -104,10 +71,6 @@ loaded_line:
     }
 
     fclose(f);
-    if (!c->zoom_text[0]) strcpy(c->zoom_text, "Z");
-    if (!c->persp_text[0]) strcpy(c->persp_text, "F5");
-    if (!c->drop_text[0]) strcpy(c->drop_text, "Q");
-    if (!c->n_text[0]) strcpy(c->n_text, "N");
     return 1;
 }
 
@@ -119,13 +82,8 @@ int nc_cfg_save(const NcConfig *c, const char *path) {
     for (int i = 0; i < NC_NFIELDS; i++) {
         if (FIELDS[i].is_float)
             fprintf(f, "%s=%.4f\n", FIELDS[i].key, *(const float *)((const char *)c + FIELDS[i].off));
-        else {
-            int iv = *(const int *)((const char *)c + FIELDS[i].off);
-            if (strstr(FIELDS[i].key, "_col") || strstr(FIELDS[i].key, "_bg_col"))
-                fprintf(f, "%s=0x%06X\n", FIELDS[i].key, iv & 0xFFFFFF);
-            else
-                fprintf(f, "%s=%d\n", FIELDS[i].key, iv);
-        }
+        else
+            fprintf(f, "%s=%d\n", FIELDS[i].key, *(const int *)((const char *)c + FIELDS[i].off));
     }
 
     fprintf(f, "zoom_text=%s\n", c->zoom_text);

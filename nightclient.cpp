@@ -377,15 +377,8 @@ static int snapshot_arrow_count(void *player) {
     if (!player) return -1;
     void *supplies = player_getSupplies(player);
     if (!supplies) return -1;
-
-    /* The container-size path is also used by Fast Totem and is a safe
-     * sanity check before touching the aggregate count call. */
-    int size = supplies_getContainerSize(supplies, 0);
-    if (size <= 0 || size > 128) return -1;
-
     int n = supplies_getItemCount(supplies, 262, 0); /* 262 = arrow */
-    if (n < 0 || n > 4096) return -1;
-    return n;
+    return n < 0 ? -1 : n;
 }
 
 /* Inventory-screen fast totem: swap the first totem in the normal player
@@ -395,7 +388,7 @@ static bool fast_totem_move() {
     if (!player) return false;
 
     const void *offhand = mob_getOffhandSlot(player);
-    if (offhand && !ii_isNull(offhand) && ii_getId(offhand) == 450) /* 450 = Totem of Undying */
+    if (offhand && !ii_isNull(offhand) && ii_getId(offhand) == 449) /* 449 = totem */
         return false;
 
     void *supplies = player_getSupplies(player);
@@ -409,7 +402,7 @@ static bool fast_totem_move() {
     const void *source = 0;
     for (int i = 0; i < size; ++i) {
         const void *it = supplies_getItem(supplies, i, inventory_container);
-        if (it && !ii_isNull(it) && ii_getId(it) == 450) {
+        if (it && !ii_isNull(it) && ii_getId(it) == 449) {
             source_slot = i;
             source = it;
             break;
@@ -519,16 +512,12 @@ static void hook_tick(void *self, void *player) {
     } else {
         g_snap.elytra_angle_valid = 0;
     }
+    if (g_cfg.arrow_on) g_snap.arrow_count = snapshot_arrow_count(player);
+    else g_snap.arrow_count = -1;
     if (g_cfg.elytra_on) g_snap.gliding = mob_isGliding(player) ? 1 : 0;
     if (g_cfg.arrow_on) {
         const void *held = player_getSelectedItem(player);
         g_snap.holding_bow = (held && !ii_isNull(held) && ii_getId(held) == 261) ? 1 : 0;   /* 261 = bow */
-        /* Only query the arrow inventory while the Arrow HUD can actually be
-         * visible. This avoids hammering the inventory API every player tick. */
-        g_snap.arrow_count = g_snap.holding_bow ? snapshot_arrow_count(player) : -1;
-    } else {
-        g_snap.holding_bow = 0;
-        g_snap.arrow_count = -1;
     }
     if (g_cfg.armor_on) {
         for (int i = 0; i < 4; i++) {
